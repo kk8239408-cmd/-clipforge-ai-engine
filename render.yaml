@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: clipforge-ai-engine
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: WHISPER_MODEL
+        value: base
+      - key: MAX_UPLOAD_MB
+        value: "500"
