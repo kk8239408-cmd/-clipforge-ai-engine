@@ -123,7 +123,13 @@ def status(jid):
 
 @app.get("/jobs/{jid}/clips/{filename}")
 def clip(jid,filename):
+    
+@app.get("/jobs/{jid}/clips/{filename}")
+def clip(jid, filename):
     if not re.fullmatch(r"clip_[1-5]\.mp4", filename):
-    p=OUT/jid/filename
-    if not p.exists(): raise HTTPException(404,"Clip not ready")
-    return FileResponse(p,media_type="video/mp4",filename=filename)
+        raise HTTPException(400, "Invalid clip name")
+    p = OUT / jid / filename
+    if not p.exists():
+        raise HTTPException(404, "Clip not ready")
+    return FileResponse(p, media_type="video/mp4", filename=filename)
+    
