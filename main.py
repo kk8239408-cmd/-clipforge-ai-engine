@@ -1,169 +1,123 @@
-import os, re, uuid, json, shutil, subprocess, threading
+import os, re, uuid, subprocess, threading, shutil, json
 from pathlib import Path
-from typing import Optional
+import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from faster_whisper import WhisperModel
+from fastapi.responses import FileResponse
 
-BASE = Path(os.getenv("DATA_DIR", "/tmp/clipforge"))
-INBOX = BASE / "inbox"
-OUT = BASE / "outputs"
-for p in (INBOX, OUT): p.mkdir(parents=True, exist_ok=True)
+BASE=Path(os.getenv("DATA_DIR","/tmp/clipforge"))
+INBOX=BASE/"inbox"; OUT=BASE/"outputs"
+INBOX.mkdir(parents=True,exist_ok=True); OUT.mkdir(parents=True,exist_ok=True)
+app=FastAPI(title="CLIPFORGE Lightweight AI Engine",version="0.2.0")
+app.add_middleware(CORSMiddleware,allow_origins=os.getenv("CORS_ORIGINS","*").split(","),allow_credentials=False,allow_methods=["*"],allow_headers=["*"])
+JOBS={}; LOCK=threading.Lock()
 
-app = FastAPI(title="CLIPFORGE AI Engine", version="0.1.0")
-app.add_middleware(
-    CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
-    allow_credentials=False, allow_methods=["*"], allow_headers=["*"]
-)
-
-JOBS = {}
-LOCK = threading.Lock()
-MODEL = None
-
-def whisper():
-    global MODEL
-    if MODEL is None:
-        # CPU-friendly starter. On a small free server this can still be slow.
-        MODEL = WhisperModel(os.getenv("WHISPER_MODEL", "base"),
-                             device="cpu", compute_type="int8")
-    return MODEL
-
-def run(cmd):
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if p.returncode:
-        raise RuntimeError(p.stderr[-3000:])
+def cmd(args):
+    p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+    if p.returncode: raise RuntimeError(p.stderr[-1800:])
     return p.stdout
 
-def duration(path):
-    out = run(["ffprobe","-v","error","-show_entries","format=duration",
-               "-of","default=noprint_wrappers=1:nokey=1",str(path)])
-    return float(out.strip())
+def get_duration(p):
+    return float(cmd(["ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",str(p)]).strip())
 
-def score_segment(text, avg_words, duration_s):
-    # Transparent starter ranking, not a trained virality predictor.
-    t = text.lower()
-    hooks = ["what happened", "no way", "oh my god", "wait", "actually",
-             "i can't believe", "the truth", "crazy", "insane", "secret",
-             "never", "best", "worst", "why", "how"]
-    score = min(len(text.split()) / 24, 1.0) * 2
-    score += sum(1.0 for h in hooks if h in t)
-    score += min(sum(1 for c in "!?..." if c in text) * 0.25, 1.0)
-    score += 0.5 if 12 <= duration_s <= 55 else 0
-    score += min(avg_words / 4, 1.0)
-    return score
-
-def choose_moments(segments, total, wanted=5):
-    # Merge speech into overlapping 20–55s windows, rank, then avoid overlap.
-    windows = []
-    start = 0.0
-    while start < total:
-        end = min(total, start + 42)
-        selected = [s for s in segments if s["end"] > start and s["start"] < end]
-        if selected:
-            txt = " ".join(s["text"].strip() for s in selected).strip()
-            if len(txt.split()) >= 12:
-                avg = len(txt.split()) / max(end-start, 1)
-                windows.append({"start": max(0, selected[0]["start"]-1.2),
-                                "end": min(total, selected[-1]["end"]+1.8),
-                                "text": txt,
-                                "score": score_segment(txt, avg, end-start)})
-        start += 24
-    windows.sort(key=lambda x: x["score"], reverse=True)
-    chosen = []
-    for w in windows:
-        if all(w["end"] <= c["start"] or w["start"] >= c["end"] for c in chosen):
-            chosen.append(w)
-        if len(chosen) == wanted: break
-    return sorted(chosen, key=lambda x: x["start"])
-
-def escape_ass(s):
-    return s.replace("\\","\\\\").replace("{","\\{").replace("}","\\}").replace("\n"," ")
-
-def render_clip(src, item, outpath, index):
-    start, end = item["start"], item["end"]
-    # One starter style: vertical 9:16, center crop, clean bold bottom captions.
-    # Captions use the selected moment's transcript as a readable two-line block.
-    caption = escape_ass(item["text"])
-    ass = outpath.with_suffix(".ass")
-    ass.write_text(
-        "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n"
-        "[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,OutlineColour,"
-        "BackColour,Bold,Italic,BorderStyle,Outline,Shadow,Alignment,MarginL,"
-        "MarginR,MarginV,Encoding\n"
-        "Style: Default,Arial,58,&H00FFFFFF,&H00101010,&H80000000,-1,0,1,4,2,2,70,70,180,1\n"
-        "[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
-        f"Dialogue: 0,0:00:00.00,0:00:{max(1,end-start):05.2f},Default,,0,0,0,,{caption}\n",
-        encoding="utf-8")
-    vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,subtitles=" + str(ass)
-    run(["ffmpeg","-y","-ss",str(start),"-i",str(src),"-t",str(end-start),
-         "-vf",vf,"-c:v","libx264","-preset","veryfast","-crf","24",
-         "-c:a","aac","-b:a","128k","-movflags","+faststart",str(outpath)])
-    ass.unlink(missing_ok=True)
-
-def process(job_id, source):
+def transcribe_groq(video_path):
+    key=os.getenv("GROQ_API_KEY")
+    if not key: raise RuntimeError("Missing GROQ_API_KEY. Add it in Render → Environment after creating a Groq API key. Check the provider's current limits and pricing first.")
+    audio=video_path.with_suffix(".mp3")
+    # Mono low-bitrate audio keeps uploads small and avoids loading an ML model on Render.
+    cmd(["ffmpeg","-y","-i",str(video_path),"-vn","-ac","1","-ar","16000","-b:a","48k",str(audio)])
     try:
-        with LOCK: JOBS[job_id]["status"] = "transcribing"
-        model = whisper()
-        segs, info = model.transcribe(str(source), vad_filter=True, word_timestamps=False)
-        segments = [{"start": float(s.start), "end": float(s.end), "text": s.text}
-                    for s in segs if s.text.strip()]
-        total = duration(source)
-        moments = choose_moments(segments, total, 5)
-        if not moments:
-            raise RuntimeError("No speech-rich moments found. Try a video with clear dialogue.")
-        jobout = OUT / job_id
-        jobout.mkdir(parents=True, exist_ok=True)
-        clips = []
-        for i, item in enumerate(moments, 1):
-            path = jobout / f"clip_{i}.mp4"
-            render_clip(source, item, path, i)
-            clips.append({"index": i, "start": round(item["start"],2),
-                          "end": round(item["end"],2), "score": round(item["score"],2),
-                          "file": f"/jobs/{job_id}/clips/{path.name}"})
-            with LOCK:
-                JOBS[job_id]["progress"] = int(i/len(moments)*100)
-        with LOCK:
-            JOBS[job_id].update(status="completed", progress=100, clips=clips,
-                                note="Transcript-ranked highlights; review before posting.")
-    except Exception as e:
-        with LOCK: JOBS[job_id].update(status="failed", error=str(e))
+        with audio.open("rb") as f:
+            r=requests.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization":f"Bearer {key}"},
+                data={"model":os.getenv("GROQ_WHISPER_MODEL","whisper-large-v3-turbo"),"response_format":"verbose_json","timestamp_granularities[]":["segment"]},
+                files={"file":(audio.name,f,"audio/mpeg")},
+                timeout=240
+            )
+        if r.status_code>=400: raise RuntimeError(f"Transcription provider error ({r.status_code}): {r.text[:800]}")
+        data=r.json()
+        return [{"start":float(s.get("start",0)),"end":float(s.get("end",0)),"text":s.get("text","").strip()} for s in data.get("segments",[]) if s.get("text","").strip()]
     finally:
-        # Keep source during the job; remove it after processing to limit disk use.
-        source.unlink(missing_ok=True)
+        audio.unlink(missing_ok=True)
+
+def rank(text, span):
+    t=text.lower()
+    hooks=["no way","oh my god","wait","actually","i can't believe","crazy","insane","secret","never","best","worst","why","how","what happened"]
+    return min(len(text.split())/22,2.0)+sum(0.8 for h in hooks if h in t)+min(text.count("!")*.25,1)+(.5 if 12<=span<=55 else 0)
+
+def pick(segments,total):
+    # Score rolling windows and choose up to five non-overlapping speech-rich moments.
+    windows=[]; start=0.0
+    while start<total:
+        end=min(total,start+38)
+        ss=[s for s in segments if s["end"]>start and s["start"]<end]
+        if ss:
+            txt=" ".join(s["text"] for s in ss).strip()
+            if len(txt.split())>=8:
+                a=max(0,ss[0]["start"]-1); b=min(total,ss[-1]["end"]+1.5)
+                windows.append({"start":a,"end":b,"text":txt,"score":rank(txt,b-a)})
+        start+=19
+    windows.sort(key=lambda x:x["score"],reverse=True)
+    chosen=[]
+    for w in windows:
+        if all(w["end"]<=c["start"] or w["start"]>=c["end"] for c in chosen):
+            chosen.append(w)
+        if len(chosen)>=5: break
+    return sorted(chosen,key=lambda x:x["start"])
+
+def render(src,item,dest):
+    dur=max(1,item["end"]-item["start"])
+    # Conservative 720x1280 output and ultrafast encoding for small free instances.
+    vf="scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1"
+    cmd(["ffmpeg","-y","-ss",str(item["start"]),"-i",str(src),"-t",str(dur),
+         "-vf",vf,"-c:v","libx264","-preset","ultrafast","-threads","1","-crf","29",
+         "-c:a","aac","-b:a","96k","-movflags","+faststart",str(dest)])
+
+def process(jid,source):
+    try:
+        with LOCK: JOBS[jid].update(status="transcribing",progress=10)
+        segs=transcribe_groq(source)
+        total=get_duration(source)
+        moments=pick(segs,total)
+        if not moments: raise RuntimeError("No clear speech moments found. Try a video with spoken dialogue.")
+        folder=OUT/jid; folder.mkdir(parents=True,exist_ok=True); clips=[]
+        for i,m in enumerate(moments,1):
+            p=folder/f"clip_{i}.mp4"; render(source,m,p)
+            clips.append({"index":i,"start":round(m["start"],2),"end":round(m["end"],2),"score":round(m["score"],2),"transcript":m["text"],"download_url":f"/jobs/{jid}/clips/{p.name}"})
+            with LOCK: JOBS[jid]["progress"]=10+int(i/len(moments)*85)
+        with LOCK: JOBS[jid].update(status="completed",progress=100,clips=clips,note="Transcript-ranked candidates. Review each clip; ranking is heuristic, not a guarantee of virality.")
+    except Exception as e:
+        with LOCK: JOBS[jid].update(status="failed",error=str(e))
+    finally: source.unlink(missing_ok=True)
 
 @app.get("/health")
-def health(): return {"ok": True, "service": "CLIPFORGE AI Engine", "version": "0.1.0"}
+def health(): return {"ok":True,"service":"CLIPFORGE lightweight engine","version":"0.2.0","transcription":"hosted Groq API"}
 
 @app.post("/jobs")
-async def create_job(background: BackgroundTasks, video: UploadFile = File(...)):
-    suffix = Path(video.filename or "").suffix.lower()
-    if suffix not in {".mp4", ".mov", ".m4v"}:
-        raise HTTPException(400, "Upload an MP4 or MOV video.")
-    job_id = str(uuid.uuid4())
-    source = INBOX / f"{job_id}{suffix}"
-    size = 0
-    with source.open("wb") as f:
-        while chunk := await video.read(1024*1024):
-            size += len(chunk)
-            if size > int(os.getenv("MAX_UPLOAD_MB","500"))*1024*1024:
-                source.unlink(missing_ok=True)
-                raise HTTPException(413, "Video exceeds the upload limit.")
+async def create_job(background:BackgroundTasks,video:UploadFile=File(...)):
+    ext=Path(video.filename or "").suffix.lower()
+    if ext not in {".mp4",".mov",".m4v"}: raise HTTPException(400,"Upload MP4 or MOV.")
+    jid=str(uuid.uuid4()); src=INBOX/f"{jid}{ext}"; size=0
+    with src.open("wb") as f:
+        while chunk:=await video.read(1024*1024):
+            size+=len(chunk)
+            if size>int(os.getenv("MAX_UPLOAD_MB","150"))*1024*1024:
+                src.unlink(missing_ok=True); raise HTTPException(413,"Video exceeds 150 MB upload limit.")
             f.write(chunk)
-    with LOCK:
-        JOBS[job_id] = {"id": job_id, "status":"queued", "progress":0, "clips":[]}
-    background.add_task(process, job_id, source)
-    return {"job_id": job_id, "status":"queued"}
+    with LOCK: JOBS[jid]={"id":jid,"status":"queued","progress":0,"clips":[]}
+    background.add_task(process,jid,src)
+    return {"job_id":jid,"status":"queued"}
 
-@app.get("/jobs/{job_id}")
-def get_job(job_id: str):
+@app.get("/jobs/{jid}")
+def status(jid):
     with LOCK:
-        if job_id not in JOBS: raise HTTPException(404, "Job not found")
-        return JOBS[job_id]
+        if jid not in JOBS: raise HTTPException(404,"Job not found (free instances may restart and clear temporary jobs).")
+        return JOBS[jid]
 
-@app.get("/jobs/{job_id}/clips/{filename}")
-def get_clip(job_id: str, filename: str):
-    from fastapi.responses import FileResponse
-    if not re.fullmatch(r"clip_[1-5]\.mp4", filename): raise HTTPException(400,"Invalid filename")
-    path = OUT / job_id / filename
-    if not path.exists(): raise HTTPException(404,"Clip not ready")
-    return FileResponse(path, media_type="video/mp4", filename=filename)
+@app.get("/jobs/{jid}/clips/{filename}")
+def clip(jid,filename):
+    if not re.fullmatch(r"clip_[1-5]\\.mp4",filename): raise HTTPException(400,"Invalid clip name")
+    p=OUT/jid/filename
+    if not p.exists(): raise HTTPException(404,"Clip not ready")
+    return FileResponse(p,media_type="video/mp4",filename=filename)
