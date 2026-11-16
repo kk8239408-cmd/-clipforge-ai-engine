@@ -11,7 +11,13 @@ INBOX.mkdir(parents=True,exist_ok=True); OUT.mkdir(parents=True,exist_ok=True)
 app=FastAPI(title="CLIPFORGE Lightweight AI Engine",version="0.2.0")
 app.add_middleware(CORSMiddleware,allow_origins=os.getenv("CORS_ORIGINS","*").split(","),allow_credentials=False,allow_methods=["*"],allow_headers=["*"])
 JOBS={}; LOCK=threading.Lock()
-
+@app.get("/")
+def home():
+    return {
+        "name": "CLIPFORGE",
+        "status": "online",
+        "message": "AI clipping engine is running!"
+    }
 def cmd(args):
     p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
     if p.returncode: raise RuntimeError(p.stderr[-1800:])
