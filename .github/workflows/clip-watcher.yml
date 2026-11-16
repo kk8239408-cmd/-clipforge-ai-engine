@@ -4,23 +4,23 @@ on:
   workflow_dispatch:
     inputs:
       channel:
-        description: "Twitch channel name"
+        description: Twitch channel username
         required: true
         type: string
       minutes:
-        description: "Watch duration in minutes (1-330)"
+        description: Watch duration in minutes (1-330)
         required: true
-        default: "60"
+        default: '60'
         type: string
       mult:
-        description: "Chat spike multiplier"
+        description: Chat spike multiplier
         required: true
-        default: "2.5"
+        default: '2.5'
         type: string
       min_count:
-        description: "Minimum chat messages in each 10-second window"
+        description: Minimum chat messages per 10-second window
         required: true
-        default: "10"
+        default: '10'
         type: string
 
 permissions:
@@ -31,20 +31,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
-      - name: Check out watcher
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install system tools
+      - name: Install FFmpeg and fonts
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-liberation fonts-montserrat
+          sudo apt-get install -y ffmpeg fonts-liberation
 
-      - name: Install Python tools
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install streamlink faster-whisper
@@ -57,19 +57,20 @@ jobs:
           MIN_COUNT: ${{ inputs.min_count }}
         run: |
           python - <<'PY'
-          import os, re
-          channel = os.environ["CHANNEL"].strip()
-          minutes = int(os.environ["MINUTES"])
-          mult = float(os.environ["MULT"])
-          min_count = int(os.environ["MIN_COUNT"])
-          if not re.fullmatch(r"[A-Za-z0-9_]+", channel):
-              raise SystemExit("Invalid Twitch channel name.")
+          import os
+          import re
+          channel = os.environ['CHANNEL'].strip()
+          minutes = int(os.environ['MINUTES'])
+          multiplier = float(os.environ['MULT'])
+          min_count = int(os.environ['MIN_COUNT'])
+          if not re.fullmatch(r'[A-Za-z0-9_]+', channel):
+              raise SystemExit('Invalid Twitch channel username.')
           if not 1 <= minutes <= 330:
-              raise SystemExit("Minutes must be between 1 and 330.")
-          if not 1.0 <= mult <= 10.0:
-              raise SystemExit("Multiplier must be between 1 and 10.")
+              raise SystemExit('Minutes must be between 1 and 330.')
+          if not 1.0 <= multiplier <= 10.0:
+              raise SystemExit('Multiplier must be between 1 and 10.')
           if not 1 <= min_count <= 500:
-              raise SystemExit("Minimum chat count must be between 1 and 500.")
+              raise SystemExit('Minimum chat count must be between 1 and 500.')
           PY
 
       - name: Watch stream and create clips
