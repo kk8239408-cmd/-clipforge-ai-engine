@@ -127,4 +127,4 @@ def clip(jid, filename):
     p = OUT / jid / filename
     if not p.exists():
         raise HTTPException(404, "Clip not ready")
-            return FileResponse(p, media_type="video/mp4", filename=filename)
+    return FileResponse(p, media_type="video/mp4", filename=filename)
