@@ -1,0 +1,11 @@
+name: CLIPFORGE Workflow Check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test
+        run: echo "CLIPFORGE Actions is working"
