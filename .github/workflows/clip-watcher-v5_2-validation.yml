@@ -2,6 +2,11 @@ name: ClipForge V5.2 Validation
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/clip-watcher-v5_2-validation.yml'
+      - 'clip_watcher_v5_2.py'
 
 permissions:
   contents: read
