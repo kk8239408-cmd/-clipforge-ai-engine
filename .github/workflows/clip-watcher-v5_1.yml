@@ -95,7 +95,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: clip-1
-          path: clips/clip-1.mp4
+          path: clips/clip-1_score*.mp4
           if-no-files-found: ignore
           compression-level: 0
           retention-days: 7
@@ -105,7 +105,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: clip-2
-          path: clips/clip-2.mp4
+          path: clips/clip-2_score*.mp4
           if-no-files-found: ignore
           compression-level: 0
           retention-days: 7
@@ -115,41 +115,22 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: clip-3
-          path: clips/clip-3.mp4
+          path: clips/clip-3_score*.mp4
           if-no-files-found: ignore
           compression-level: 0
           retention-days: 7
 
-      - name: Upload small watcher log
+      - name: Upload summary and watcher log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: clipforge-log
-          path: clips/watcher.log
+          name: clipforge-summary-and-log
+          path: |
+            clips/summary.json
+            clips/watcher.log
           if-no-files-found: warn
           compression-level: 9
           retention-days: 7
-
-      - name: Optional 360p proxy
-        if: always() && inputs.upload_raw
-        run: |
-          if compgen -G "clips/buffer/*.ts" > /dev/null; then
-            printf "file '%s'\n" "$PWD"/clips/buffer/*.ts > clips/proxy-list.txt
-            ffmpeg -y -hide_banner -loglevel error -f concat -safe 0 -i clips/proxy-list.txt -vf "scale=-2:360" -c:v libx264 -preset veryfast -crf 30 -an -movflags +faststart clips/source-proxy-360p.mp4
-          else
-            echo "No retained buffer segments available for proxy."
-          fi
-        continue-on-error: true
-
-      - name: Upload optional 360p proxy
-        if: always() && inputs.upload_raw
-        uses: actions/upload-artifact@v4
-        with:
-          name: source-proxy-360p
-          path: clips/source-proxy-360p.mp4
-          if-no-files-found: ignore
-          compression-level: 0
-          retention-days: 3
 
       - name: Validate output and clean temporary source files
         if: always()
