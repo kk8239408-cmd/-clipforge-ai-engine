@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """V5.1 Twitch live clipper with a bounded rolling TS buffer and continuous scoring."""
-import argparse, csv, json, os, re, shutil, socket, subprocess, threading, time, glob
+import argparse, csv, json, os, re, shutil, socket, subprocess, threading, time, glob, zipfile
 from collections import deque
 import cv2
 import numpy as np
@@ -179,14 +179,70 @@ def frame_features(path):
             "face":float(np.std(face_sizes)) if len(face_sizes)>1 else 0}
 
 def transcribe_words(path):
+    """English word timestamps with VAD and conservative word-confidence filtering."""
     from faster_whisper import WhisperModel
-    model=WhisperModel("base",device="cpu",compute_type="int8")
-    segs,_=model.transcribe(path,word_timestamps=True,vad_filter=True)
+    model=WhisperModel("small",device="cpu",compute_type="int8")
+    segs,_=model.transcribe(path,language="en",word_timestamps=True,vad_filter=True,
+                            beam_size=5,best_of=5,condition_on_previous_text=False)
     words=[]
-    for s in segs:
-        for w in (s.words or []):
-            if w.word.strip(): words.append({"start":float(w.start),"end":float(w.end),"word":w.word.strip()})
+    for seg in segs:
+        for w in (seg.words or []):
+            token=(w.word or "").strip()
+            if not token: continue
+            probability=float(getattr(w,"probability",0.0) or 0.0)
+            if probability < 0.45: continue
+            words.append({"start":float(w.start),"end":float(w.end),"word":token,
+                          "probability":probability})
+    log("[whisper] ran=true model=small language=en vad=true word_timestamps=true confident_words=%d"%len(words))
     return words
+
+def _caption_emphasis(word):
+    raw=word.strip(); clean=re.sub(r"[^A-Za-z0-9'@._:-]","",raw); upper=clean.upper()
+    if re.search(r"\\d",clean) or re.search(r"\\b(?:AM|PM)\\b",upper): return "&H0000FF00&"
+    if re.search(r"\\b(?:NETFLIX|TWITCH|YOUTUBE|XQC|MRBEAST)\\b",upper): return "&H000000FF&"
+    if raw.isupper() and len(raw)>=2: return "&H000000FF&"
+    if upper in {"INSANE","INSANELY","CRAZY","WTF","FUCK","SHIT","NO","WAY","HOLY","OMG","BRO"}: return "&H0000FFFF&"
+    return "&H00FFFFFF&"
+
+def write_caption_ass(words, ass):
+    font_name="Bebas Neue"
+    font_dir=os.path.join(os.path.dirname(__file__),"fonts")
+    archive=os.path.join(font_dir,"CLIPFORGE_Curated_Font_Library.zip")
+    if os.path.isfile(archive):
+        try:
+            with zipfile.ZipFile(archive) as z:
+                members=[n for n in z.namelist() if n.lower().endswith((".ttf",".otf")) and "bebas" in os.path.basename(n).lower()]
+                for member in members:
+                    target=os.path.join(font_dir,os.path.basename(member))
+                    if not os.path.exists(target):
+                        with z.open(member) as src,open(target,"wb") as dst: shutil.copyfileobj(src,dst)
+                    font_name=os.path.splitext(os.path.basename(member))[0]
+                    break
+        except Exception as e: log("[captions] curated font extraction unavailable: "+str(e)[:120])
+    head="""[Script Info]
+ScriptType: v4.00+
+PlayResX: 720
+PlayResY: 1280
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: Default,%s,64,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,8,3,5,12,12,0,1
+[Events]
+Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+"""%font_name
+    rows=[]; i=0
+    while i<len(words):
+        group=[words[i]]; i+=1
+        while i<len(words) and len(group)<3 and words[i]["start"]-group[-1]["end"]<0.22:
+            group.append(words[i]); i+=1
+        tokens=[]
+        for w in group:
+            token=w["word"].upper().strip(",.!?;:")
+            color=_caption_emphasis(token)
+            tokens.append("{\\c"+color+"}"+token+"{\\c&H00FFFFFF&}" if color!="&H00FFFFFF&" else token)
+        rows.append("Dialogue: 0,%s,%s,Default,,0,0,0,,%s"%(ass_time(group[0]["start"]),ass_time(max(group[0]["start"]+.12,group[-1]["end"]+.12))," ".join(tokens)))
+    with open(ass,"w",encoding="utf-8") as f: f.write(head+"\\n".join(rows)+"\\n")
+    log("[captions] font=%s words=%d groups=%d white_default=true outline=8 shadow=3"%(font_name,len(words),len(rows)))
+    return len(words)
 
 def score_candidate(path, stats, audio_values, baseline_loud):
     reasons=[]; chat=stats["chat"]; unique=stats["unique"]; emotes=stats["emotes"]; keywords=stats["keywords"]
@@ -221,7 +277,7 @@ def score_candidate(path, stats, audio_values, baseline_loud):
     hook_score=min(100,35+sum(REACTION_WORDS[k]*12 for k in hook_hits3)) if hook_hits3 else min(45,len(hook_words)*7)
     if hook_score<50: reasons.append("weak opening hook")
     score=min(100,round(chat_pts+unique_pts+burst_pts+peak_pts+motion_pts+scene_pts+face_pts+transcript_pts+hook_score*.25))
-    if len(words)<8:
+    if sum(1 for w in words if float(w.get("probability",1.0))>=0.45)<8:
         score=max(0,score-12); reasons.append("under 8 transcript words (-12)")
     if stats["luma"]<18: score=max(0,score-30); reasons.append("very dark/near-black")
     if stats["motion"]<0.35 and stats["scene"]<0.03: score=max(0,score-35); reasons.append("static footage")
@@ -276,23 +332,8 @@ def render_ranked_clip(src, out):
     face=detect_face_crop(src)
     ass=out+".ass"
     words=transcribe_words(src)
-    if not words: raise RuntimeError("Faster-Whisper produced no word timestamps")
-    log("[captions] "+os.path.basename(out)+" word_timestamps="+str(len(words)))
-    head="""[Script Info]
-ScriptType: v4.00+
-PlayResX: 720
-PlayResY: 1280
-[V4+ Styles]
-Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
-Style: Default,Arial,58,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,7,3,5,10,10,0,1
-[Events]
-Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
-"""
-    colors=["&H00FFFF00&","&H0000FFFF&","&H0000FF00&"]; rows=[]
-    for i,w in enumerate(words):
-        st=w["start"]; en=max(st+.12,min(words[i+1]["start"] if i+1<len(words) else w["end"]+.25,w["end"]+.25))
-        rows.append("Dialogue: 0,%s,%s,Default,,0,0,0,,{\\c%s\\bord8\\shad3\\b1}%s"%(ass_time(st),ass_time(en),colors[i%3],w["word"].upper().strip(",.!?;:")))
-    with open(ass,"w",encoding="utf-8") as f: f.write(head+NL.join(rows)+NL)
+    if not words: raise RuntimeError("Faster-Whisper produced no confident word timestamps")
+    write_caption_ass(words,ass)
     x,y,w,h=face if face else (0,0,1,1)
     # Top is the detected face. Bottom uses a gameplay crop shifted away from the detected face box.
     if face:
@@ -323,7 +364,7 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
     if p.returncode: raise RuntimeError("render failed: "+p.stderr[-1000:])
     result=probe(out); size=os.path.getsize(out)
     if result.get("duration",0)<15 or result.get("duration",0)>25.5: raise RuntimeError("duration outside 15-25s: "+str(result))
-    if (result.get("width"),result.get("height"))!=(720,1280) or not result.get("audio") or abs(result.get("fps",0)-30)>.2: raise RuntimeError("output probe failed: "+str(result))
+    if (result.get("width"),result.get("height"))!=(720,1280) or not result.get("audio") or abs(result.get("fps",0)-60)>.2: raise RuntimeError("output probe failed: "+str(result))
     log("[render] "+os.path.basename(out)+" bytes=%d size_mib=%.2f ffprobe=%s words=%d"%(size,size/1048576,result,len(words)))
     if size>40*1024*1024: log("[WARN] output exceeds 40 MiB")
     os.remove(ass)
@@ -362,7 +403,7 @@ def validate_pipeline():
     os.makedirs("validate-output",exist_ok=True)
     seg_pattern="validate-output/segment_%03d.ts"
     p=run(["ffmpeg","-y","-hide_banner","-loglevel","error",
-           "-f","lavfi","-i","testsrc2=size=1280x720:rate=30:duration=30",
+           "-f","lavfi","-i","testsrc2=size=1280x720:rate=60:duration=30",
            "-f","lavfi","-i","sine=frequency=440:sample_rate=44100:duration=30",
            "-map","0:v:0","-map","1:a:0","-c:v","libx264","-preset","ultrafast",
            "-pix_fmt","yuv420p","-c:a","aac","-f","segment","-segment_time","10",
