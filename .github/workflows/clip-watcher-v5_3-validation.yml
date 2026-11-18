@@ -1,0 +1,52 @@
+name: ClipForge V5.3 Validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/clip-watcher-v5_3-validation.yml'
+      - 'clip_watcher_v5_3.py'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy opencv-python-headless==4.10.0.84
+      - name: Check / install FFmpeg
+        run: |
+          set -euo pipefail
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            sudo apt-get install -y --no-install-recommends ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+      - name: Compile V5.3
+        run: python -m py_compile clip_watcher_v5_3.py
+      - name: Run offline V5.3 validation
+        run: |
+          set -o pipefail
+          python -u clip_watcher_v5_3.py --validate-only 2>&1 | tee v5-3-validation.log
+      - name: Upload validation outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v5-3-validation-results
+          path: |
+            v5-3-validation.log
+            validate-output/render-no-face.mp4
+            validate-output/render-face.mp4
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 7
