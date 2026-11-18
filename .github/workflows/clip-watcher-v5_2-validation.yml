@@ -27,30 +27,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy opencv-python-headless==4.10.0.84
 
-      - name: Restore cached static FFmpeg
-        id: ffmpeg-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/clipforge-ffmpeg
-          key: clipforge-ffmpeg-static-linux-x64-v1
-
-      - name: Download FFmpeg only on cache miss
-        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+      - name: Check / install FFmpeg
         run: |
           set -euo pipefail
-          mkdir -p "$HOME/.cache/clipforge-ffmpeg"
-          curl -fsSL --retry 3 --connect-timeout 15 --output /tmp/clipforge-ffmpeg.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
-          tar -xJf /tmp/clipforge-ffmpeg.tar.xz -C /tmp
-          ffdir="$(find /tmp -maxdepth 1 -type d -name 'ffmpeg-*-amd64-static' -print -quit)"
-          test -n "$ffdir"
-          install -m 0755 "$ffdir/ffmpeg" "$HOME/.cache/clipforge-ffmpeg/ffmpeg"
-          install -m 0755 "$ffdir/ffprobe" "$HOME/.cache/clipforge-ffmpeg/ffprobe"
-
-      - name: Add cached FFmpeg to PATH and verify
-        run: |
-          echo "$HOME/.cache/clipforge-ffmpeg" >> "$GITHUB_PATH"
-          "$HOME/.cache/clipforge-ffmpeg/ffmpeg" -version | head -n 1
-          "$HOME/.cache/clipforge-ffmpeg/ffprobe" -version | head -n 1
+          if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+            echo "FFmpeg already available on runner"
+          else
+            echo "Installing FFmpeg using runner's existing apt package index"
+            if ! sudo apt-get install -y --no-install-recommends ffmpeg; then
+              echo "Existing apt index failed; refresh once and retry"
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends ffmpeg
+            fi
+          fi
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
 
       - name: Compile V5.2
         run: python -m py_compile clip_watcher_v5_2.py
