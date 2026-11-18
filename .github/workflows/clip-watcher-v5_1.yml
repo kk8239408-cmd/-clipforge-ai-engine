@@ -48,7 +48,7 @@ on:
       ai_review:
         description: "Optional CLIP frame scoring (slower CPU install; rejects static/browser/dashboard frames)"
         required: false
-        default: true
+        default: false
         type: boolean
       zoom:
         description: "Zoom strength: 0.5 subtle, 1.0 normal, 1.5 strong"
@@ -80,12 +80,16 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install FFmpeg and fonts
+      - name: Setup FFmpeg (prebuilt static binaries)
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          ffmpeg-version: "7.1.1"
+          linking-type: static
+
+      - name: Verify media tools
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y ffmpeg fonts-montserrat fonts-liberation fonts-noto-color-emoji
-          fc-cache -f
           ffmpeg -version | head -1
+          ffprobe -version | head -1
 
       - name: Install clipping dependencies
         run: pip install streamlink faster-whisper numpy pillow
