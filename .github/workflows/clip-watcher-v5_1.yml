@@ -80,14 +80,24 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install FFmpeg (minimal)
-        run: |
-          sudo apt-get install -y --no-install-recommends ffmpeg
-          ffmpeg -version | head -1
-          ffprobe -version | head -1
-
       - name: Install clipping dependencies
-        run: pip install streamlink faster-whisper numpy pillow
+        run: pip install streamlink faster-whisper numpy pillow static-ffmpeg
+
+      - name: Fetch self-contained FFmpeg binaries
+        run: |
+          python - <<'PY'
+          import os, shutil, static_ffmpeg
+          static_ffmpeg.add_paths()
+          ffmpeg = shutil.which("ffmpeg")
+          ffprobe = shutil.which("ffprobe")
+          if not ffmpeg or not ffprobe:
+              raise SystemExit("static-ffmpeg did not provide ffmpeg and ffprobe")
+          bindir = os.path.dirname(ffmpeg)
+          with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as f:
+              f.write(bindir + os.linesep)
+          print("FFmpeg:", ffmpeg)
+          print("FFprobe:", ffprobe)
+          PY
 
       - name: Install optional CLIP scoring (CPU only)
         if: ${{ inputs.ai_review }}
