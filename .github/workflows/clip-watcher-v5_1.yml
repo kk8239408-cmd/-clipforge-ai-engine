@@ -33,7 +33,7 @@ on:
       sfx:
         description: "Synthetic whoosh + riser/impact timed to the loudest moment"
         required: false
-        default: true
+        default: false
         type: boolean
       music:
         description: "Add your own royalty-free music from the repo's music/ folder"
@@ -48,7 +48,7 @@ on:
       ai_review:
         description: "Optional CLIP frame scoring (slow CPU install; disabled for the first test)"
         required: false
-        default: false
+        default: true
         type: boolean
       zoom:
         description: "Zoom strength: 0.5 subtle, 1.0 normal, 1.5 strong"
