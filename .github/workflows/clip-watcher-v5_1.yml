@@ -80,13 +80,9 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Setup FFmpeg (prebuilt static binaries)
-        uses: FedericoCarboni/setup-ffmpeg@v3
-        with:
-          ffmpeg-version: release
-
-      - name: Verify media tools
+      - name: Install FFmpeg (minimal)
         run: |
+          sudo apt-get install -y --no-install-recommends ffmpeg
           ffmpeg -version | head -1
           ffprobe -version | head -1
 
