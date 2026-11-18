@@ -30,7 +30,7 @@ def probe(path):
     audio=any(s.get("codec_type")=="audio" for s in j.get("streams",[]))
     rate=v.get("r_frame_rate","0/1").split("/")
     fps=float(rate[0])/max(1.0,float(rate[1])) if len(rate)>1 else 0
-    return {"duration":float(j.get("format",{}).get("duration",0) or 0),"width":int(v.get("width",0) or 0),"height":int(v.get("height",0) or 0),"fps":fps,"audio":audio}
+    return {"duration":float(j.get("format",{}).get("duration",0) or 0),"width":int(v.get("width",0) or 0),"height":int(v.get("height",0) or 0),"fps":fps,"audio":audio,"size_bytes":os.path.getsize(path) if os.path.isfile(path) else 0}
 
 class TwitchChat(threading.Thread):
     def __init__(self, channel):
@@ -205,20 +205,25 @@ def _caption_emphasis(word):
     return "&H00FFFFFF&"
 
 def write_caption_ass(words, ass):
-    font_name="Bebas Neue"
+    font_name="Liberation Sans Narrow"
     font_dir=os.path.join(os.path.dirname(__file__),"fonts")
     archive=os.path.join(font_dir,"CLIPFORGE_Curated_Font_Library.zip")
     if os.path.isfile(archive):
         try:
             with zipfile.ZipFile(archive) as z:
-                members=[n for n in z.namelist() if n.lower().endswith((".ttf",".otf")) and "bebas" in os.path.basename(n).lower()]
-                for member in members:
-                    target=os.path.join(font_dir,os.path.basename(member))
+                font_files=[n for n in z.namelist() if n.lower().endswith((".ttf",".otf"))]
+                preferred=[n for n in font_files if "bebas" in os.path.basename(n).lower()]
+                if not preferred:
+                    preferred=[n for n in font_files if any(k in os.path.basename(n).lower() for k in ("anton","oswald","condensed","narrow","impact"))]
+                if preferred:
+                    member=preferred[0]; target=os.path.join(font_dir,os.path.basename(member))
                     if not os.path.exists(target):
                         with z.open(member) as src,open(target,"wb") as dst: shutil.copyfileobj(src,dst)
                     font_name=os.path.splitext(os.path.basename(member))[0]
-                    break
-        except Exception as e: log("[captions] curated font extraction unavailable: "+str(e)[:120])
+                    log("[captions-font] archive_font_found=true file=%s family=%s"%(member,font_name))
+                else: log("[captions-font] Bebas-style/condensed font missing; fallback=system Liberation Sans Narrow")
+        except Exception as e: log("[captions-font] ZIP unavailable; fallback=system Liberation Sans Narrow reason="+str(e)[:120])
+    else: log("[captions-font] ZIP missing; fallback=system Liberation Sans Narrow")
     head="""[Script Info]
 ScriptType: v4.00+
 PlayResX: 720
@@ -356,17 +361,18 @@ def render_ranked_clip(src, out):
     if brightness:
         top_filters.append(brightness.lstrip(","))
         bottom_filters.append(brightness.lstrip(","))
-    final_filters=["vstack","drawbox=x=0:y=637:w=720:h=6:color=black:t=fill","subtitles=%s:force_style=MarginV=35"%ass,"format=yuv420p"]
+    final_filters=["vstack","drawbox=x=0:y=637:w=720:h=6:color=black:t=fill","subtitles=%s:fontsdir=%s:force_style=MarginV=0"%(ass,font_dir.replace("\\\\","/")),"format=yuv420p"]
     graph="[0:v]split=2[a][b];[a]%s[top];[b]%s[bottom];[top][bottom]%s[v]"%(",".join(x for x in top_filters if x.strip()),",".join(x for x in bottom_filters if x.strip()),",".join(x for x in final_filters if x.strip()))
     if ",," in graph or graph.endswith(","): raise RuntimeError("empty FFmpeg filter in graph: "+graph)
-    cmd=["ffmpeg","-y","-hide_banner","-loglevel","error","-i",src,"-filter_complex",graph,"-map","[v]","-map","0:a:0?","-c:v","libx264","-preset","veryfast","-crf","25","-r","60","-fps_mode","cfr","-t","25","-c:a","aac","-b:a","128k","-movflags","+faststart",out]
+    cmd=["ffmpeg","-y","-hide_banner","-loglevel","error","-i",src,"-filter_complex",graph,"-map","[v]","-map","0:a:0?","-c:v","libx264","-preset","veryfast","-crf","28","-maxrate","10M","-bufsize","20M","-r","60","-fps_mode","cfr","-t","25","-c:a","aac","-b:a","128k","-movflags","+faststart",out]
     p=run(cmd,capture_output=True,text=True)
     if p.returncode: raise RuntimeError("render failed: "+p.stderr[-1000:])
     result=probe(out); size=os.path.getsize(out)
     if result.get("duration",0)<15 or result.get("duration",0)>25.5: raise RuntimeError("duration outside 15-25s: "+str(result))
     if (result.get("width"),result.get("height"))!=(720,1280) or not result.get("audio") or abs(result.get("fps",0)-60)>.2: raise RuntimeError("output probe failed: "+str(result))
     log("[render] "+os.path.basename(out)+" bytes=%d size_mib=%.2f ffprobe=%s words=%d"%(size,size/1048576,result,len(words)))
-    if size>40*1024*1024: log("[WARN] output exceeds 40 MiB")
+    if size>40*1024*1024: raise RuntimeError("output exceeds 40 MiB cap: %.2f MiB"%(size/1048576))
+    log("[ffprobe-final] fps=%.3f width=%d height=%d audio=%s duration=%.2fs file_size=%d bytes (%.2f MiB)"%(result["fps"],result["width"],result["height"],result["audio"],result["duration"],size,size/1048576))
     os.remove(ass)
     return {"duration":result["duration"],"bytes":size,"words":len(words)}
 
