@@ -26,6 +26,34 @@ def log(msg):
 def run(cmd, **kw):
     return subprocess.run(cmd, **kw)
 
+def run_ffmpeg_progress(cmd, label):
+    """Stream periodic FFmpeg progress so long renders never look stalled."""
+    progress_cmd = cmd[:1] + ["-progress", "pipe:1", "-nostats"] + cmd[1:]
+    started = time.monotonic()
+    proc = subprocess.Popen(progress_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    fields = {}
+    recent = deque(maxlen=20)
+    last_log = 0.0
+    for raw in proc.stdout:
+        line = raw.strip()
+        if not line:
+            continue
+        if "=" in line:
+            key, value = line.split("=", 1)
+            fields[key] = value
+            if key == "progress":
+                now = time.monotonic()
+                if now - last_log >= 3.0 or value == "end":
+                    log("[ffmpeg:%s] frame=%s time=%s speed=%s elapsed=%.1fs" %
+                        (label, fields.get("frame", "?"), fields.get("out_time", "?"),
+                         fields.get("speed", "?"), now - started))
+                    last_log = now
+        else:
+            recent.append(line)
+    rc = proc.wait()
+    return subprocess.CompletedProcess(progress_cmd, rc, stdout="", stderr="\n".join(recent))
+
 def probe(path):
     p=run(["ffprobe","-v","error","-show_entries","format=duration:stream=codec_type,width,height,r_frame_rate","-of","json",path],capture_output=True,text=True)
     if p.returncode: return {}
@@ -316,7 +344,16 @@ def extract_candidate(paths, out):
     p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","concat","-safe","0","-i",concat,"-c","copy",joined],capture_output=True,text=True)
     if p.returncode: raise RuntimeError("candidate concat failed: "+p.stderr[-500:])
     # Three chunks: 20s pre-roll plus first 5s of the following chunk.
-    p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",joined,"-t","25","-map","0:v:0","-map","0:a:0?","-c:v","libx264","-preset","veryfast","-crf","25","-c:a","aac","-b:a","128k",src],capture_output=True,text=True)
+    # Prefer packet-copy remuxing: decoding and re-encoding here is wasted because
+    # the final vertical render has to encode the video again anyway.
+    p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",joined,"-t","25",
+           "-map","0:v:0","-map","0:a:0?","-c","copy","-movflags","+faststart",src],
+          capture_output=True,text=True)
+    if p.returncode:
+        log("[ffmpeg] candidate stream-copy unavailable; using compatibility re-encode")
+        p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",joined,"-t","25",
+               "-map","0:v:0","-map","0:a:0?","-c:v","libx264","-preset","veryfast",
+               "-crf","25","-c:a","aac","-b:a","128k",src],capture_output=True,text=True)
     if p.returncode: raise RuntimeError("candidate trim failed: "+p.stderr[-500:])
     for x in (concat,joined):
         try: os.remove(x)
@@ -355,8 +392,9 @@ def render_ranked_clip(src, out):
         bx=0.0 if x>0.45 else min(0.35,max(0.0,x+w))
         bottom="crop=w='trunc(iw*0.62/2)*2':h='trunc(ih*0.62/2)*2':x='trunc(iw*%.4f/2)*2':y='trunc(ih*0.20/2)*2'"%bx
     else:
-        top="scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960"
-        bottom="scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960"
+        # The common scale/crop filters below already fill both panels.
+        top="null"
+        bottom="null"
     # Brighten only genuinely dark source footage.
     brightness=",eq=brightness=0.06:contrast=1.03" if info.get("duration",0) and frame_features(src)["luma"]<35 else ""
     # Build each chain from non-empty filters only; no-face uses explicit full-frame fallback.
@@ -375,8 +413,8 @@ def render_ranked_clip(src, out):
     final_filters=["vstack","drawbox=x=0:y=957:w=1080:h=6:color=black:t=fill",sub,"format=yuv420p"]
     graph="[0:v]split=2[a][b];[a]%s[top];[b]%s[bottom];[top][bottom]%s[v]"%(",".join(x for x in top_filters if x.strip()),",".join(x for x in bottom_filters if x.strip()),",".join(x for x in final_filters if x.strip()))
     if ",," in graph or graph.endswith(","): raise RuntimeError("empty FFmpeg filter in graph: "+graph)
-    cmd=["ffmpeg","-y","-hide_banner","-loglevel","error","-i",src,"-filter_complex",graph,"-map","[v]","-map","0:a:0?","-c:v","libx264","-preset","veryfast","-crf","28","-maxrate","10M","-bufsize","20M","-r","60","-fps_mode","cfr","-t","25","-c:a","aac","-b:a","128k","-movflags","+faststart",out]
-    p=run(cmd,capture_output=True,text=True)
+    cmd=["ffmpeg","-y","-hide_banner","-loglevel","error","-i",src,"-filter_complex",graph,"-map","[v]","-map","0:a:0?","-c:v","libx264","-preset","superfast","-crf","28","-maxrate","10M","-bufsize","20M","-r","60","-fps_mode","cfr","-t","25","-c:a","aac","-b:a","128k","-movflags","+faststart",out]
+    p=run_ffmpeg_progress(cmd,"final-render")
     if p.returncode: raise RuntimeError("render failed: "+p.stderr[-1000:])
     result=probe(out); size=os.path.getsize(out)
     if result.get("duration",0)<15 or result.get("duration",0)>25.5: raise RuntimeError("duration outside 15-25s: "+str(result))
