@@ -304,7 +304,11 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
         bottom="scale=720:640:force_original_aspect_ratio=increase,crop=720:640"
     # Brighten only genuinely dark source footage.
     brightness=",eq=brightness=0.06:contrast=1.03" if info.get("duration",0) and frame_features(src)["luma"]<35 else ""
-    graph="[0:v]split=2[a][b];[a]%s,scale=720:640:force_original_aspect_ratio=increase,crop=720:640[top];[b]%s%s,scale=720:640:force_original_aspect_ratio=increase,crop=720:640[bottom];[top][bottom]vstack,drawbox=x=0:y=637:w=720:h=6:color=black:t=fill,subtitles=%s:force_style='MarginV=35',format=yuv420p[v]"%(top,bottom,brightness,ass)
+    mask=""
+    if face:
+        fx,fy,fw,fh=face
+        mask=",drawbox=x=iw*%.5f:y=ih*%.5f:w=iw*%.5f:h=ih*%.5f:color=black:t=fill"%(fx,fy,fw,fh)
+    graph="[0:v]split=2[a][b];[a]%s,scale=720:640:force_original_aspect_ratio=increase,crop=720:640[top];[b]%s%s%s,scale=720:640:force_original_aspect_ratio=increase,crop=720:640[bottom];[top][bottom]vstack,drawbox=x=0:y=637:w=720:h=6:color=black:t=fill,subtitles=%s:force_style=MarginV=35,format=yuv420p[v]"%(top,mask,bottom,brightness,ass)
     cmd=["ffmpeg","-y","-hide_banner","-loglevel","error","-i",src,"-filter_complex",graph,"-map","[v]","-map","0:a:0?","-c:v","libx264","-preset","veryfast","-crf","25","-r","30","-fps_mode","cfr","-t","25","-c:a","aac","-b:a","128k","-movflags","+faststart",out]
     p=run(cmd,capture_output=True,text=True)
     if p.returncode: raise RuntimeError("render failed: "+p.stderr[-1000:])
