@@ -359,7 +359,7 @@ def render_ranked_clip(src, out):
     final_filters=["vstack","drawbox=x=0:y=637:w=720:h=6:color=black:t=fill","subtitles=%s:force_style=MarginV=35"%ass,"format=yuv420p"]
     graph="[0:v]split=2[a][b];[a]%s[top];[b]%s[bottom];[top][bottom]%s[v]"%(",".join(x for x in top_filters if x.strip()),",".join(x for x in bottom_filters if x.strip()),",".join(x for x in final_filters if x.strip()))
     if ",," in graph or graph.endswith(","): raise RuntimeError("empty FFmpeg filter in graph: "+graph)
-    cmd=["ffmpeg","-y","-hide_banner","-loglevel","error","-i",src,"-filter_complex",graph,"-map","[v]","-map","0:a:0?","-c:v","libx264","-preset","veryfast","-crf","25","-r","30","-fps_mode","cfr","-t","25","-c:a","aac","-b:a","128k","-movflags","+faststart",out]
+    cmd=["ffmpeg","-y","-hide_banner","-loglevel","error","-i",src,"-filter_complex",graph,"-map","[v]","-map","0:a:0?","-c:v","libx264","-preset","veryfast","-crf","25","-r","60","-fps_mode","cfr","-t","25","-c:a","aac","-b:a","128k","-movflags","+faststart",out]
     p=run(cmd,capture_output=True,text=True)
     if p.returncode: raise RuntimeError("render failed: "+p.stderr[-1000:])
     result=probe(out); size=os.path.getsize(out)
