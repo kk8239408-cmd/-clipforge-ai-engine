@@ -34,7 +34,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.cache/clipforge-ffmpeg"
-          curl -fsSL --retry 3 --connect-timeout 15 \\
+          curl -fsSL --retry 3 --connect-timeout 15 \
             https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \\
             -o /tmp/clipforge-ffmpeg.tar.xz
           tar -xJf /tmp/clipforge-ffmpeg.tar.xz -C /tmp
