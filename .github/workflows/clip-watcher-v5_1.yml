@@ -46,7 +46,7 @@ on:
         default: false
         type: boolean
       ai_review:
-        description: "Optional CLIP frame scoring (slow CPU install; disabled for the first test)"
+        description: "Optional CLIP frame scoring (slower CPU install; rejects static/browser/dashboard frames)"
         required: false
         default: true
         type: boolean
