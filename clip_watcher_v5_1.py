@@ -354,8 +354,8 @@ def validate_pipeline():
     os.makedirs("validate-output",exist_ok=True)
     seg_pattern="validate-output/segment_%03d.ts"
     p=run(["ffmpeg","-y","-hide_banner","-loglevel","error",
-           "-f","lavfi","-i","testsrc2=size=1280x720:rate=30:duration=10",
-           "-f","lavfi","-i","sine=frequency=440:sample_rate=44100:duration=10",
+           "-f","lavfi","-i","testsrc2=size=1280x720:rate=30:duration=30",
+           "-f","lavfi","-i","sine=frequency=440:sample_rate=44100:duration=30",
            "-map","0:v:0","-map","1:a:0","-c:v","libx264","-preset","ultrafast",
            "-pix_fmt","yuv420p","-c:a","aac","-f","segment","-segment_time","10",
            "-reset_timestamps","1","-segment_format","mpegts",seg_pattern],
