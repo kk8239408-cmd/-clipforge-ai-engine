@@ -1,0 +1,107 @@
+name: CLIPFORGE Twitch Clip Watcher V4 Studio
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Twitch channel username
+        required: true
+        type: string
+      minutes:
+        description: Watch duration in minutes (1-330)
+        required: true
+        default: '10'
+        type: string
+      mult:
+        description: Chat spike multiplier
+        required: true
+        default: '1.35'
+        type: string
+      min_count:
+        description: Minimum messages per 10-second window
+        required: true
+        default: '10'
+        type: string
+      min_unique:
+        description: Minimum distinct chatters
+        required: true
+        default: '4'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clipforge-v4-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  studio:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install FFmpeg and fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-liberation
+          fc-cache -f
+
+      - name: Install clipping and editing dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install streamlink faster-whisper edge-tts pillow transformers
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Validate inputs
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          MINUTES: ${{ inputs.minutes }}
+          MULT: ${{ inputs.mult }}
+          MIN_COUNT: ${{ inputs.min_count }}
+          MIN_UNIQUE: ${{ inputs.min_unique }}
+        run: |
+          python - <<'PY'
+          import os, re
+          assert re.fullmatch(r'[A-Za-z0-9_]+', os.environ['CHANNEL']), 'Invalid Twitch channel name'
+          m=float(os.environ['MINUTES']); assert 1 <= m <= 330, 'Minutes must be 1-330'
+          assert float(os.environ['MULT']) > 0, 'Multiplier must be positive'
+          assert int(os.environ['MIN_COUNT']) >= 1, 'Minimum messages must be positive'
+          assert int(os.environ['MIN_UNIQUE']) >= 1, 'Minimum unique chatters must be positive'
+          PY
+
+      - name: Watch stream and create edited clips
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          MINUTES: ${{ inputs.minutes }}
+          MULT: ${{ inputs.mult }}
+          MIN_COUNT: ${{ inputs.min_count }}
+          MIN_UNIQUE: ${{ inputs.min_unique }}
+        run: |
+          python clip_watcher_v4.py "$CHANNEL" \
+            --max-minutes "$MINUTES" \
+            --mult "$MULT" \
+            --min-count "$MIN_COUNT" \
+            --min-unique "$MIN_UNIQUE" \
+            --font "Liberation Sans" \
+            --out clips
+
+      - name: Upload edited clips and AI report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipforge-v4-${{ inputs.channel }}-${{ github.run_number }}
+          path: |
+            clips/clip_*.mp4
+            clips/clipforge_report.json
+          if-no-files-found: warn
+          retention-days: 3
+          
