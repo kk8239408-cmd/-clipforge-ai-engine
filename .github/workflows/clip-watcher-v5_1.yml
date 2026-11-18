@@ -81,23 +81,23 @@ jobs:
           python-version: "3.11"
 
       - name: Install clipping dependencies
-        run: pip install streamlink faster-whisper numpy pillow static-ffmpeg
+        run: pip install streamlink faster-whisper numpy pillow
 
-      - name: Fetch self-contained FFmpeg binaries
+      - name: Download one static FFmpeg build
         run: |
-          python - <<'PY'
-          import os, shutil, static_ffmpeg
-          static_ffmpeg.add_paths()
-          ffmpeg = shutil.which("ffmpeg")
-          ffprobe = shutil.which("ffprobe")
-          if not ffmpeg or not ffprobe:
-              raise SystemExit("static-ffmpeg did not provide ffmpeg and ffprobe")
-          bindir = os.path.dirname(ffmpeg)
-          with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as f:
-              f.write(bindir + os.linesep)
-          print("FFmpeg:", ffmpeg)
-          print("FFprobe:", ffprobe)
-          PY
+          mkdir -p "$HOME/ffmpeg-static"
+          curl -L --fail --retry 3 --connect-timeout 15 \
+            https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+            -o /tmp/ffmpeg-static.tar.xz
+          tar -xJf /tmp/ffmpeg-static.tar.xz -C /tmp
+          FFMPEG_BIN="$(find /tmp -maxdepth 2 -type f -name ffmpeg -perm -111 | head -n 1)"
+          FFPROBE_BIN="$(find /tmp -maxdepth 2 -type f -name ffprobe -perm -111 | head -n 1)"
+          test -n "$FFMPEG_BIN" && test -n "$FFPROBE_BIN"
+          ln -sf "$FFMPEG_BIN" "$HOME/ffmpeg-static/ffmpeg"
+          ln -sf "$FFPROBE_BIN" "$HOME/ffmpeg-static/ffprobe"
+          echo "$HOME/ffmpeg-static" >> "$GITHUB_PATH"
+          "$HOME/ffmpeg-static/ffmpeg" -version | head -n 1
+          "$HOME/ffmpeg-static/ffprobe" -version | head -n 1
 
       - name: Install optional CLIP scoring (CPU only)
         if: ${{ inputs.ai_review }}
