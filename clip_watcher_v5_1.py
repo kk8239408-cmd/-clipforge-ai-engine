@@ -9,7 +9,8 @@ SEGMENT_SECONDS = 10
 BUFFER_SECONDS = 180
 COOLDOWN_SECONDS = 45
 PRE_SECONDS = 20
-POST_SECONDS = 10
+POST_SECONDS = 5
+PRE_SECONDS = 20
 CHAT_SPIKE_MULTIPLIER = 1.35
 MIN_CHAT_SCORE = 5
 LOUDNESS_JUMP_DB = 3.0
@@ -198,15 +199,15 @@ def score_candidate(path, stats, audio_values, baseline_loud):
     loud=audio_values["loud"]; jump=loud-baseline_loud
     peak_pts=min(12,max(0,jump)*1.1)
     if peak_pts>=2: reasons.append("audio peak/shout")
-    if audio_values["silence_reaction"]: peak_pts=min(14,peak_pts+4); reasons.append("silence-to-reaction")
-    if audio_values["laughter"]: reasons.append("possible laughter (audio peak pattern)")
+    if audio_values["silence_reaction"]: peak_pts=min(14,peak_pts+4); reasons.append("silence-to-loudness-jump proxy only; not shout recognition")
+    if audio_values["laughter"]: reasons.append("audio-peak laughter proxy only; not laughter recognition")
     motion=stats["motion"]
     motion_pts=min(10,max(0,motion-1.0)*1.8)
     scene_pts=min(6,stats["scene"]*12)
     if motion_pts>=2: reasons.append("motion burst")
     if scene_pts>=2: reasons.append("scene change")
     face_pts=min(5,stats["face"]*500)
-    if face_pts>=1: reasons.append("facecam expression/face-box change proxy")
+    if face_pts>=1: reasons.append("face-box variation proxy only; not expression recognition")
     words=transcribe_words(path)
     text=" ".join(w["word"] for w in words).upper()
     hook_hits=[k for k in REACTION_WORDS if k in text]
@@ -225,13 +226,29 @@ def score_candidate(path, stats, audio_values, baseline_loud):
     if stats["motion"]<0.35 and stats["scene"]<0.03: score=max(0,score-35); reasons.append("static footage")
     return score,hook_score,reasons,words
 
+def footage_rejection(features, path):
+    """Hard reject black, frozen, and dashboard-like footage."""
+    if features["luma"] < 18: return "black/near-black"
+    if features["motion"] < 0.35 and features["scene"] < 0.03: return "frozen/static"
+    cap=cv2.VideoCapture(path)
+    if not cap.isOpened(): return "unreadable"
+    ok,fr=cap.read(); cap.release()
+    if not ok: return "unreadable"
+    gray=cv2.cvtColor(cv2.resize(fr,(320,180)),cv2.COLOR_BGR2GRAY)
+    edges=cv2.Canny(gray,70,150)
+    density=float(np.mean(edges>0))
+    hist=cv2.calcHist([gray],[0],None,[16],[0,256]).flatten()
+    dominant=float(hist.max()/max(1,hist.sum()))
+    if density>0.16 and dominant>0.18: return "dashboard/browser-like UI"
+    return None
+
 def extract_candidate(paths, out):
     concat=out+".concat.txt"; joined=out+".joined.ts"; src=out+".candidate.mp4"
     with open(concat,"w",encoding="utf-8") as f:
         for p in paths: f.write("file '%s'\\n"%os.path.abspath(p).replace("'","'\\''"))
     p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","concat","-safe","0","-i",concat,"-c","copy",joined],capture_output=True,text=True)
     if p.returncode: raise RuntimeError("candidate concat failed: "+p.stderr[-500:])
-    # Three 10-second chunks: 20s before trigger end + 5s after it.
+    # Four chunks: 20s pre-roll + 5s post-roll from the trigger point.
     p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",joined,"-t","25","-map","0:v:0","-map","0:a:0?","-c","copy",src],capture_output=True,text=True)
     if p.returncode: raise RuntimeError("candidate trim failed: "+p.stderr[-500:])
     for x in (concat,joined):
@@ -287,6 +304,27 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
     return {"duration":result["duration"],"bytes":size,"words":len(words)}
 
 
+def validate_pipeline():
+    for binary in ("ffmpeg","ffprobe"):
+        p=run([binary,"-version"],capture_output=True,text=True)
+        if p.returncode: raise RuntimeError(binary+" unavailable")
+    os.makedirs("validate-output",exist_ok=True)
+    src="validate-output/synthetic.mp4"; out="validate-output/smoke.mp4"
+    p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","lavfi","-i","testsrc2=size=1280x720:rate=30:duration=26","-f","lavfi","-i","sine=frequency=440:sample_rate=44100:duration=26","-vf","drawbox=x=mod(t*80\\,900):y=200:w=180:h=140:color=red:t=fill","-c:v","libx264","-pix_fmt","yuv420p","-c:a","aac","-shortest",src],capture_output=True,text=True)
+    if p.returncode: raise RuntimeError("lavfi generation failed: "+p.stderr[-400:])
+    global transcribe_words
+    old=transcribe_words
+    transcribe_words=lambda path:[{"start":i*1.2,"end":i*1.2+.3,"word":w} for i,w in enumerate(["NO","WAY","BRO","THAT","WAS","ACTUALLY","INSANE","CLIP","IT","NOW"])]
+    try:
+        features=frame_features(src)
+        if footage_rejection(features,src): raise RuntimeError("synthetic footage rejected")
+        rendered=render_ranked_clip(src,out)
+        info=probe(out)
+        if not 15<=info.get("duration",0)<=25: raise RuntimeError("duration validation failed: "+str(info))
+        log("[validate] PASS synthetic render="+str(info)+" details="+str(rendered))
+    finally:
+        transcribe_words=old
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("channel",nargs="?",default="xqc")
@@ -295,7 +333,10 @@ def main():
     ap.add_argument("--threshold",type=int,default=70)
     ap.add_argument("--out",default="clips")
     ap.add_argument("--no-effects",action="store_true")
+    ap.add_argument("--validate-only",action="store_true")
     a=ap.parse_args()
+    if a.validate_only:
+        validate_pipeline(); return
     if not re.fullmatch(r"[A-Za-z0-9_]+",a.channel): raise SystemExit("invalid channel")
     if not 3<=a.max_minutes<=5: raise SystemExit("duration must be 3-5 minutes")
     os.makedirs(a.out,exist_ok=True); buf=os.path.join(a.out,"buffer"); os.makedirs(buf,exist_ok=True)
@@ -342,8 +383,12 @@ def main():
                 fired=(count>=max(5,baseline*1.35) or jump>=3 or motion>=2)
                 log("[moment] t=%ds chat=%d unique=%d emotes=%d keywords=%d loud=%.1fdB jump=%.1f motion=%.2f luma=%.1f trigger=%s"%(idx*10,count,unique,emotes,keywords,loud,jump,motion,fftr["luma"],fired))
                 # Record every moment as a candidate; trigger moments get a 25s exact buffer window.
-                if fired and idx>=1:
-                    ids=[idx-1,idx,idx+1]
+                if fired and idx>=2:
+                    reject=footage_rejection(fftr,seg)
+                    if reject:
+                        log("[candidate-skip] t=%ds reason=%s"%(idx*10,reject))
+                        continue
+                    ids=[idx-2,idx-1,idx,idx+1]
                     candidates.append({"idx":idx,"ids":ids,"chat":count,"unique":unique,"emotes":emotes,"keywords":keywords,"baseline":baseline,"loud":loud,"jump":jump,"motion":motion,"scene":fftr["scene"],"face":fftr["face"],"luma":fftr["luma"],"silence_reaction":audio["silence_reaction"],"laughter":audio["laughter"]})
                 cutoff=max(0,idx-(BUFFER_SECONDS//SEGMENT_SECONDS)+1)
                 for old in glob.glob(os.path.join(buf,"segment_*.ts")):
@@ -399,7 +444,7 @@ def main():
         if any(abs(c["idx"]-x["idx"])<3 for x in chosen): continue
         chosen.append(c); used.add(c["idx"])
         if len(chosen)>=min(3,a.max_clips): break
-    summary={"score_is":"heuristic estimate, not a prediction of views","threshold":a.threshold,"low_rated_fallback":low_fallback,"streamer_requested":a.channel,"streamer_used":selected,"candidates_found":len(candidates),"ranked_candidates":[],"exports":[]}
+    summary={"score_is":"heuristic estimate, not a prediction of views","signal_limits":{"laughter":"audio-peak proxy only","shouting":"loudness-jump proxy only","face_expression":"face-box variation proxy only"},"threshold":a.threshold,"low_rated_fallback":low_fallback,"streamer_requested":a.channel,"streamer_used":selected,"candidates_found":len(candidates),"ranked_candidates":[],"exports":[]}
     for rank,c in enumerate(ranked,1):
         summary["ranked_candidates"].append({"rank":rank,"timestamp_seconds":c["idx"]*10,"score":c.get("score",0),"hook_score":c.get("hook_score",0),"reasons":c.get("reasons",[])})
     for n,c in enumerate(chosen,1):
