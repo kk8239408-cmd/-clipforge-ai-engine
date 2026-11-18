@@ -13,10 +13,10 @@ on:
         required: true
         default: "4"
         type: string
-      upload_raw:
-        description: "Also upload a 360p proxy (never the source recording)"
+      validate_only:
+        description: "Run offline V5.1 validation only; do not connect to Twitch"
         required: true
-        default: false
+        default: true
         type: boolean
 
 permissions:
@@ -69,6 +69,26 @@ jobs:
           ffmpeg -version | head -n 1
           ffprobe -version | head -n 1
 
+      - name: Validate V5.1 syntax and offline render
+        run: |
+          set -euo pipefail
+          python -m py_compile clip_watcher_v5_1.py
+          command -v ffmpeg
+          command -v ffprobe
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+          python -u clip_watcher_v5_1.py --validate-only 2>&1 | tee validate.log
+
+      - name: Upload validation log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v5-1-validation-log
+          path: validate.log
+          if-no-files-found: warn
+          compression-level: 9
+          retention-days: 7
+
       - name: Validate inputs
         env:
           CHANNEL: ${{ inputs.channel }}
@@ -81,10 +101,10 @@ jobs:
           PY
 
       - name: Run rolling-buffer watcher and render
+        if: inputs.validate_only != true
         env:
           CHANNEL: ${{ inputs.channel }}
           MINUTES: ${{ inputs.minutes }}
-          UPLOAD_RAW: ${{ inputs.upload_raw }}
         run: |
           mkdir -p clips
           set -o pipefail
