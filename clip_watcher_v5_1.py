@@ -248,15 +248,28 @@ def extract_candidate(paths, out):
         for p in paths: f.write("file '%s'\\n"%os.path.abspath(p).replace("'","'\\''"))
     p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","concat","-safe","0","-i",concat,"-c","copy",joined],capture_output=True,text=True)
     if p.returncode: raise RuntimeError("candidate concat failed: "+p.stderr[-500:])
-    # Four chunks: 20s pre-roll + 5s post-roll from the trigger point.
-    p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",joined,"-t","25","-map","0:v:0","-map","0:a:0?","-c","copy",src],capture_output=True,text=True)
+    # Three chunks: 20s pre-roll plus first 5s of the following chunk.
+    p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",joined,"-t","25","-map","0:v:0","-map","0:a:0?","-c:v","libx264","-preset","veryfast","-crf","25","-c:a","aac","-b:a","128k",src],capture_output=True,text=True)
     if p.returncode: raise RuntimeError("candidate trim failed: "+p.stderr[-500:])
     for x in (concat,joined):
         try: os.remove(x)
         except OSError: pass
     return src
 
+def trim_dead_air(src):
+    """Trim leading silence with audio/video clocks kept aligned."""
+    p=run(["ffmpeg","-hide_banner","-i",src,"-af","silencedetect=noise=-38dB:d=0.25","-f","null","-"],capture_output=True,text=True)
+    m=re.search(r"silence_end:\\s*([0-9.]+)",p.stderr or "")
+    offset=max(0.0,float(m.group(1))-0.12) if m else 0.0
+    if offset<0.4: return src
+    out=src+".action.mp4"
+    q=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-ss",str(offset),"-i",src,"-t",str(max(15,25-offset)),"-c:v","libx264","-preset","veryfast","-crf","25","-c:a","aac","-b:a","128k",out],capture_output=True,text=True)
+    if q.returncode: raise RuntimeError("dead-air trim failed: "+q.stderr[-400:])
+    log("[hook] leading_silence_trimmed=%.2fs (audio proxy)"%offset)
+    return out
+
 def render_ranked_clip(src, out):
+    src=trim_dead_air(src)
     info=probe(src)
     if info.get("duration",0)<15: raise RuntimeError("candidate shorter than 15s")
     face=detect_face_crop(src)
@@ -388,7 +401,7 @@ def main():
                     if reject:
                         log("[candidate-skip] t=%ds reason=%s"%(idx*10,reject))
                         continue
-                    ids=[idx-2,idx-1,idx,idx+1]
+                    ids=[idx-1,idx,idx+1]
                     candidates.append({"idx":idx,"ids":ids,"chat":count,"unique":unique,"emotes":emotes,"keywords":keywords,"baseline":baseline,"loud":loud,"jump":jump,"motion":motion,"scene":fftr["scene"],"face":fftr["face"],"luma":fftr["luma"],"silence_reaction":audio["silence_reaction"],"laughter":audio["laughter"]})
                 cutoff=max(0,idx-(BUFFER_SECONDS//SEGMENT_SECONDS)+1)
                 for old in glob.glob(os.path.join(buf,"segment_*.ts")):
