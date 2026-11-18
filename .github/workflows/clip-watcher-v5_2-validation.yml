@@ -22,10 +22,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy opencv-python-headless==4.10.0.84
 
-      - name: Install FFmpeg
+      - name: Check / install FFmpeg
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+            echo "FFmpeg is already present on the runner:"
+            ffmpeg -version | head -n 1
+            ffprobe -version | head -n 1
+          else
+            echo "FFmpeg missing; installing fallback package."
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends ffmpeg
+          fi
 
       - name: Compile V5.2
         run: python -m py_compile clip_watcher_v5_2.py
