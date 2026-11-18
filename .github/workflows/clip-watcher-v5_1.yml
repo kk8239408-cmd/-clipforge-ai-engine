@@ -83,21 +83,45 @@ jobs:
       - name: Install clipping dependencies
         run: pip install streamlink faster-whisper numpy pillow
 
-      - name: Download one static FFmpeg build
+      - name: Install FFmpeg (validated BtbN static build, apt fallback)
         run: |
-          mkdir -p "$HOME/ffmpeg-static"
-          curl -L --fail --retry 3 --connect-timeout 15 \
-            https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
-            -o /tmp/ffmpeg-static.tar.xz
-          tar -xJf /tmp/ffmpeg-static.tar.xz -C /tmp
-          FFMPEG_BIN="$(find /tmp -maxdepth 2 -type f -name ffmpeg -perm -111 | head -n 1)"
-          FFPROBE_BIN="$(find /tmp -maxdepth 2 -type f -name ffprobe -perm -111 | head -n 1)"
-          test -n "$FFMPEG_BIN" && test -n "$FFPROBE_BIN"
-          ln -sf "$FFMPEG_BIN" "$HOME/ffmpeg-static/ffmpeg"
-          ln -sf "$FFPROBE_BIN" "$HOME/ffmpeg-static/ffprobe"
-          echo "$HOME/ffmpeg-static" >> "$GITHUB_PATH"
-          "$HOME/ffmpeg-static/ffmpeg" -version | head -n 1
-          "$HOME/ffmpeg-static/ffprobe" -version | head -n 1
+          set -e
+          mkdir -p "$HOME/ff"
+          ARCHIVE="/tmp/ffmpeg-master-latest-linux64-gpl.tar.xz"
+          URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+          STATIC_OK=0
+
+          if curl -fL --retry 4 --retry-all-errors --retry-delay 2 --connect-timeout 20 "$URL" -o "$ARCHIVE" \
+             && [ "$(stat -c%s "$ARCHIVE" 2>/dev/null || echo 0)" -gt 50000000 ] \
+             && xz -t "$ARCHIVE"; then
+            mkdir -p "$HOME/ff"
+            if tar -xJf "$ARCHIVE" --strip-components=2 -C "$HOME/ff" --wildcards '*/bin/ffmpeg' '*/bin/ffprobe' \
+               && [ -x "$HOME/ff/ffmpeg" ] && [ -x "$HOME/ff/ffprobe" ]; then
+              STATIC_OK=1
+            fi
+          fi
+
+          if [ "$STATIC_OK" -ne 1 ]; then
+            echo "Static FFmpeg download/validation/extraction failed; diagnostics follow."
+            ls -l "$ARCHIVE" || true
+            if [ -f "$ARCHIVE" ]; then head -c 300 "$ARCHIVE" || true; echo; fi
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends ffmpeg
+            echo "/usr/bin" >> "$GITHUB_PATH"
+          else
+            echo "$HOME/ff" >> "$GITHUB_PATH"
+          fi
+
+      - name: Verify FFmpeg
+        run: |
+          set -e
+          echo "Architecture: $(uname -m)"
+          command -v ffmpeg
+          command -v ffprobe
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+          test -x "$(command -v ffmpeg)"
+          test -x "$(command -v ffprobe)"
 
       - name: Install optional CLIP scoring (CPU only)
         if: ${{ inputs.ai_review }}
