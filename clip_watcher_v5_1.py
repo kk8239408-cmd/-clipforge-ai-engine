@@ -195,7 +195,7 @@ def main():
             files=sorted(glob.glob(os.path.join(buf,"segment_*.ts")))
             # Newest chunk is still being written; score only closed segments.
             for seg in files[:-1]:
-                match=re.search(r"segment_(\\d+)\\.ts$",seg)
+                match=re.search(r"segment_(\d+)\.ts$",seg)
                 if not match: continue
                 idx=int(match.group(1))
                 if idx in processed_ids: continue
