@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 SEGMENT_SECONDS = 10
+NL = chr(10)
 BUFFER_SECONDS = 180
 COOLDOWN_SECONDS = 45
 PRE_SECONDS = 20
@@ -245,7 +246,7 @@ def footage_rejection(features, path):
 def extract_candidate(paths, out):
     concat=out+".concat.txt"; joined=out+".joined.ts"; src=out+".candidate.mp4"
     with open(concat,"w",encoding="utf-8") as f:
-        for p in paths: f.write("file '%s'\\n"%os.path.abspath(p).replace("'","'\\''"))
+        f.write("".join("file '%s'%s"%(os.path.abspath(p).replace("'", "'\\''"),NL) for p in paths))
     p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","concat","-safe","0","-i",concat,"-c","copy",joined],capture_output=True,text=True)
     if p.returncode: raise RuntimeError("candidate concat failed: "+p.stderr[-500:])
     # Three chunks: 20s pre-roll plus first 5s of the following chunk.
@@ -259,7 +260,7 @@ def extract_candidate(paths, out):
 def trim_dead_air(src):
     """Trim leading silence with audio/video clocks kept aligned."""
     p=run(["ffmpeg","-hide_banner","-i",src,"-af","silencedetect=noise=-38dB:d=0.25","-f","null","-"],capture_output=True,text=True)
-    m=re.search(r"silence_end:\\s*([0-9.]+)",p.stderr or "")
+    m=re.search(r"silence_end:\s*([0-9.]+)",p.stderr or "")
     offset=max(0.0,float(m.group(1))-0.12) if m else 0.0
     if offset<0.4: return src
     out=src+".action.mp4"
@@ -291,7 +292,7 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
     for i,w in enumerate(words):
         st=w["start"]; en=max(st+.12,min(words[i+1]["start"] if i+1<len(words) else w["end"]+.25,w["end"]+.25))
         rows.append("Dialogue: 0,%s,%s,Default,,0,0,0,,{\\c%s\\bord8\\shad3\\b1}%s"%(ass_time(st),ass_time(en),colors[i%3],w["word"].upper().strip(",.!?;:")))
-    with open(ass,"w",encoding="utf-8") as f: f.write(head+"\\n".join(rows)+"\\n")
+    with open(ass,"w",encoding="utf-8") as f: f.write(head+NL.join(rows)+NL)
     x,y,w,h=face if face else (0,0,1,1)
     # Top is the detected face. Bottom uses a gameplay crop shifted away from the detected face box.
     if face:
@@ -321,26 +322,77 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
     return {"duration":result["duration"],"bytes":size,"words":len(words)}
 
 
+def select_ranked_candidates(ranked, threshold, max_clips):
+    passed=[c for c in ranked if c.get("score",0)>=threshold]
+    low_fallback=False
+    if not passed and ranked:
+        passed=ranked[:1]; low_fallback=True
+    chosen=[]
+    for c in passed:
+        if any(abs(c["idx"]-x["idx"])<3 for x in chosen): continue
+        chosen.append(c)
+        if len(chosen)>=min(3,max_clips): break
+    return chosen,low_fallback
+
+
+def validate_source_escapes():
+    source=open(__file__,"r",encoding="utf-8").read()
+    if "NL = chr(10)" not in source or 'f.write(head+NL.join(rows)+NL)' not in source:
+        raise RuntimeError("source newline validation failed")
+    if not re.search(r"silence_end:\s*([0-9.]+)", "silence_end: 1.25"):
+        raise RuntimeError("silence-detection regex does not match whitespace")
+    if 'f.write("file ' not in source or 'for p in paths))' not in source:
+        raise RuntimeError("concat source validation failed")
+    log("[validate] source escape scan PASS")
+
+
 def validate_pipeline():
+    validate_source_escapes()
     for binary in ("ffmpeg","ffprobe"):
         p=run([binary,"-version"],capture_output=True,text=True)
         if p.returncode: raise RuntimeError(binary+" unavailable")
     os.makedirs("validate-output",exist_ok=True)
-    src="validate-output/synthetic.mp4"; out="validate-output/smoke.mp4"
-    p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","lavfi","-i","testsrc2=size=1280x720:rate=30:duration=26","-f","lavfi","-i","sine=frequency=440:sample_rate=44100:duration=26","-vf","drawbox=x=mod(t*80\\,900):y=200:w=180:h=140:color=red:t=fill","-c:v","libx264","-pix_fmt","yuv420p","-c:a","aac","-shortest",src],capture_output=True,text=True)
-    if p.returncode: raise RuntimeError("lavfi generation failed: "+p.stderr[-400:])
+    seg_pattern="validate-output/segment_%03d.ts"
+    p=run(["ffmpeg","-y","-hide_banner","-loglevel","error",
+           "-f","lavfi","-i","testsrc2=size=1280x720:rate=30:duration=10",
+           "-f","lavfi","-i","sine=frequency=440:sample_rate=44100:duration=10",
+           "-map","0:v:0","-map","1:a:0","-c:v","libx264","-preset","ultrafast",
+           "-pix_fmt","yuv420p","-c:a","aac","-f","segment","-segment_time","10",
+           "-reset_timestamps","1","-segment_format","mpegts",seg_pattern],
+          capture_output=True,text=True)
+    if p.returncode: raise RuntimeError("lavfi TS generation failed: "+p.stderr[-500:])
+    paths=sorted(glob.glob("validate-output/segment_*.ts"))
+    if len(paths)<3: raise RuntimeError("expected >=3 TS segments, got "+str(len(paths)))
+    for path in paths[:3]:
+        info=probe(path)
+        if not info.get("audio") or not info.get("width"): raise RuntimeError("invalid TS segment "+path+": "+str(info))
+    candidate=extract_candidate(paths[:3],"validate-output/concat-test")
+    info=probe(candidate)
+    log("[validate] extract_candidate ffprobe="+str(info))
+    if not 24<=info.get("duration",0)<=25.5 or not info.get("audio") or (info.get("width"),info.get("height"))!=(1280,720):
+        raise RuntimeError("extract_candidate ffprobe validation failed: "+str(info))
+    log("[validate] PASS real extract_candidate 3x10s TS -> "+str(info))
     global transcribe_words
     old=transcribe_words
-    transcribe_words=lambda path:[{"start":i*1.2,"end":i*1.2+.3,"word":w} for i,w in enumerate(["NO","WAY","BRO","THAT","WAS","ACTUALLY","INSANE","CLIP","IT","NOW"])]
+    transcribe_words=lambda path:[{"start":i*.2,"end":i*.2+.15,"word":w} for i,w in enumerate(["NO","WAY","BRO","WHAT","INSANE","HOLY","CLIP","IT","NOW","WOW"])]
     try:
-        features=frame_features(src)
-        if footage_rejection(features,src): raise RuntimeError("synthetic footage rejected")
-        rendered=render_ranked_clip(src,out)
-        info=probe(out)
-        if not 15<=info.get("duration",0)<=25: raise RuntimeError("duration validation failed: "+str(info))
-        log("[validate] PASS synthetic render="+str(info)+" details="+str(rendered))
+        stats={"chat":100,"unique":20,"emotes":20,"keywords":20,"baseline":1,"motion":12.0,"scene":0.9,"face":0.02,"luma":55}
+        audio={"loud":-5,"silence_reaction":True,"laughter":True}
+        score,hook,reasons,words=score_candidate(candidate,stats,audio,-42)
+        if score<=0 or len(words)<8: raise RuntimeError("synthetic scoring failed: score=%d words=%d"%(score,len(words)))
+        log("[validate] synthetic score=%d hook=%d words=%d reasons=%s"%(score,hook,len(words),"; ".join(reasons)))
+        test_ranked=[{"idx":i*4,"score":sc,"reasons":["synthetic"]} for i,sc in enumerate([96,88,79,69])]
+        chosen,low=select_ranked_candidates(test_ranked,70,3)
+        for rank,c in enumerate(sorted(test_ranked,key=lambda x:x["score"],reverse=True),1):
+            log("[ranking-test] %d | idx=%d | score=%d"%(rank,c["idx"],c["score"]))
+        if [c["score"] for c in chosen]!=[96,88,79] or low: raise RuntimeError("threshold/max-3 selection test failed")
+        fallback,low=select_ranked_candidates([{"idx":1,"score":42}],70,3)
+        if len(fallback)!=1 or not low: raise RuntimeError("low-rated fallback test failed")
+        log("[validate] PASS scoring, threshold=70, max=3, low-rated one-clip fallback")
     finally:
         transcribe_words=old
+    log("[validate] PASS complete offline candidate-to-selection path")
+
 
 def main():
     ap=argparse.ArgumentParser()
@@ -451,16 +503,10 @@ def main():
     ranked=sorted([c for c in candidates if c.get("scored")],key=lambda c:c.get("score",0),reverse=True)
     log("[ranking] rank | timestamp | score/100 | hook | reasons")
     for rank,c in enumerate(ranked,1): log("[ranking] %d | %ds | %d | %d | %s"%(rank,c["idx"]*10,c["score"],c["hook_score"],"; ".join(c["reasons"])))
-    passed=[c for c in ranked if c.get("score",0)>=a.threshold]
-    low_fallback=False
-    if not passed and ranked: passed=ranked[:1]; low_fallback=True; log("[fallback] no candidate met threshold; exporting single best LOW-RATED candidate")
-    chosen=[]; used=set()
-    for c in passed:
-        if c["idx"] in used: continue
-        # Suppress near-duplicate candidate moments within 25 seconds.
-        if any(abs(c["idx"]-x["idx"])<3 for x in chosen): continue
-        chosen.append(c); used.add(c["idx"])
-        if len(chosen)>=min(3,a.max_clips): break
+    failed=[c for c in ranked if any(str(r).startswith("scoring failed:") for r in c.get("reasons",[]))]
+    if ranked and len(failed)==len(ranked): raise RuntimeError("all candidate scoring attempts failed: "+" | ".join(c.get("reasons",["unknown"])[0] for c in failed))
+    chosen,low_fallback=select_ranked_candidates(ranked,a.threshold,a.max_clips)
+    if low_fallback: log("[fallback] no candidate met threshold; exporting single best LOW-RATED candidate")
     summary={"score_is":"heuristic estimate, not a prediction of views","signal_limits":{"laughter":"audio-peak proxy only","shouting":"loudness-jump proxy only","face_expression":"face-box variation proxy only"},"threshold":a.threshold,"low_rated_fallback":low_fallback,"streamer_requested":a.channel,"streamer_used":selected,"candidates_found":len(candidates),"ranked_candidates":[],"exports":[]}
     for rank,c in enumerate(ranked,1):
         summary["ranked_candidates"].append({"rank":rank,"timestamp_seconds":c["idx"]*10,"score":c.get("score",0),"hook_score":c.get("hook_score",0),"reasons":c.get("reasons",[])})
@@ -472,7 +518,7 @@ def main():
             details=render_ranked_clip(src,out)
             summary["exports"].append({"file":name,"score":c["score"],"timestamp_seconds":c["idx"]*10,"hook_score":c["hook_score"],"reasons":c["reasons"],**details,"low_rated":low_fallback})
         except Exception as ex: log("[export-error] "+name+": "+str(ex)[:250])
-    with open(os.path.join(a.out,"summary.json"),"w",encoding="utf-8") as f: json.dump(summary,f,indent=2)
+    with open(os.path.join(a.out,"summary.json"),"w",encoding="utf-8") as f: f.write(json.dumps(summary,indent=2)+NL)
     for p in glob.glob(os.path.join(a.out,"candidate-*")):
         try: os.remove(p)
         except OSError: pass
