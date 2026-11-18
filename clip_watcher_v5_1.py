@@ -143,7 +143,7 @@ def render_clip(segment_paths, out, clip_no):
     p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","concat","-safe","0","-i",concat,"-c","copy",joined],capture_output=True,text=True)
     if p.returncode: raise RuntimeError("segment concat failed: "+p.stderr[-700:])
     src=out+".src.mp4"
-    p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",joined,"-t","30","-map","0:v:0","-map","0:a:0?","-c","copy",src],capture_output=True,text=True)
+    p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-ss","10" if len(segment_paths)>=4 else "0","-i",joined,"-t","30","-map","0:v:0","-map","0:a:0?","-c","copy",src],capture_output=True,text=True)
     if p.returncode: raise RuntimeError("clip extraction failed: "+p.stderr[-700:])
     info=probe(src)
     if info.get("duration",0)<24: raise RuntimeError("assembled event shorter than 24 seconds")
@@ -187,16 +187,20 @@ def main():
     pattern=os.path.join(buf,"segment_%06d.ts")
     ff=subprocess.Popen(["ffmpeg","-y","-hide_banner","-loglevel","warning","-i","pipe:0","-map","0","-c","copy","-f","segment","-segment_time",str(SEGMENT_SECONDS),"-reset_timestamps","1","-segment_format","mpegts",pattern],stdin=sl.stdout,stdout=subprocess.DEVNULL,stderr=streamlog)
     sl.stdout.close()
-    start=time.time(); deadline=start+a.max_minutes*60; processed=0; scores=[]; recent_chat=[]; loud_hist=[]; motion_hist=[]; triggered=[]; last_trigger=-999; made=0
+    start=time.time(); deadline=start+a.max_minutes*60; processed_ids=set(); scores=[]; recent_chat=[]; loud_hist=[]; motion_hist=[]; triggered=[]; last_trigger=-999; made=0
     log("[buffer] rolling retention=%ds segment=%ds; clip window=20s pre +10s post"%(BUFFER_SECONDS,SEGMENT_SECONDS))
     try:
         while time.time()<deadline and ff.poll() is None:
             time.sleep(1)
             files=sorted(glob.glob(os.path.join(buf,"segment_*.ts")))
-            while processed<len(files):
-                seg=files[processed]; idx=processed; processed+=1
-                # Wait for file close/stable size before analysis.
-                time.sleep(.35)
+            # Newest chunk is still being written; score only closed segments.
+            for seg in files[:-1]:
+                match=re.search(r"segment_(\\d+)\\.ts$",seg)
+                if not match: continue
+                idx=int(match.group(1))
+                if idx in processed_ids: continue
+                processed_ids.add(idx)
+                time.sleep(.15)
                 count=chat.count(time.time()-SEGMENT_SECONDS-1)
                 recent_chat.append(count); baseline=float(np.mean(recent_chat[-6:-1])) if len(recent_chat)>1 else float(count)
                 loud=audio_loudness(seg); motion=motion_score(seg)
@@ -219,16 +223,16 @@ def main():
                         except OSError: pass
                 fired=chat_trigger or audio_trigger or motion_trigger
                 if fired and idx*10-last_trigger>=COOLDOWN_SECONDS and made+len(triggered)<a.max_clips:
-                    prior=[s for s in scores if s["idx"]<=idx][-3:]
-                    if len(prior)>=2:
-                        event={"indices":[s["idx"] for s in prior],"score":score,"trigger_idx":idx,"chat":count}
+                    prior_ids=[idx-2,idx-1,idx]
+                    if all(any(s["idx"]==n for s in scores) for n in prior_ids):
+                        event={"indices":prior_ids+[idx+1],"score":score,"trigger_idx":idx,"chat":count}
                         triggered.append(event); last_trigger=idx*10
                         log("[trigger] idx=%d score=%.2f captured_segments=%s; waiting for 10s post-roll"%(idx,score,event["indices"]))
                 # Once a full post-roll segment exists, assemble the selected 3 prior + 1 after.
                 ready=[e for e in triggered if idx>=e["trigger_idx"]+1]
                 for e in ready:
                     if made>=a.max_clips: break
-                    paths=[os.path.join(buf,"segment_%06d.ts"%i) for i in e["indices"]+[e["trigger_idx"]+1]]
+                    paths=[os.path.join(buf,"segment_%06d.ts"%i) for i in e["indices"]]
                     if all(os.path.isfile(p) and os.path.getsize(p)>1000 for p in paths):
                         made+=1; out=os.path.join(a.out,"clip-%d.mp4"%made)
                         try: render_clip(paths,out,made)
