@@ -1,0 +1,77 @@
+name: ClipForge V5.3 Live Watcher
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Twitch channel to monitor"
+        required: true
+        default: "kaicenat"
+        type: string
+      minutes:
+        description: "Live recording duration (3-5 minutes)"
+        required: true
+        default: "4"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install clipping dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install streamlink faster-whisper numpy opencv-python-headless==4.10.0.84
+      - name: Install FFmpeg
+        run: |
+          set -euo pipefail
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            sudo apt-get install -y --no-install-recommends ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+      - name: Validate inputs
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          python - <<'PY'
+          import os, re
+          assert re.fullmatch(r'[A-Za-z0-9_]+', os.environ['CHANNEL']), 'Invalid Twitch channel'
+          assert 3 <= int(os.environ['MINUTES']) <= 5, 'Duration must be 3-5 minutes'
+          PY
+      - name: Check requested Twitch stream
+        env:
+          CHANNEL: ${{ inputs.channel }}
+        run: streamlink --stream-url "https://www.twitch.tv/$CHANNEL" best >/dev/null
+      - name: Run V5.3 live watcher
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          MINUTES: ${{ inputs.minutes }}
+          CLIPFORGE_VISION_API_KEY: ${{ secrets.CLIPFORGE_VISION_API_KEY }}
+          CLIPFORGE_VISION_MODEL: gemini-2.5-flash
+        run: |
+          mkdir -p clips
+          set -o pipefail
+          python -u clip_watcher_v5_3.py "$CHANNEL" --max-minutes "$MINUTES" --max-clips 3 --out clips 2>&1 | tee clips/watcher.log
+      - name: Upload clips, summary and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipforge-v5-3-live-${{ inputs.channel }}
+          path: |
+            clips/clip-*.mp4
+            clips/summary.json
+            clips/watcher.log
+            clips/streamlink.stderr.log
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 7
