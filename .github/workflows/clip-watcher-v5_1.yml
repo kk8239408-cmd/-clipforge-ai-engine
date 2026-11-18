@@ -6,7 +6,7 @@ on:
       channel:
         description: "Twitch channel"
         required: true
-        default: "xqc"
+        default: "xQc"
         type: string
       minutes:
         description: "Live recording duration (3-5 minutes)"
@@ -69,7 +69,7 @@ jobs:
           ffmpeg -version | head -n 1
           ffprobe -version | head -n 1
 
-      - name: Validate V5.1 syntax and offline render
+      - name: Validate V5.1 source, concat, scoring and offline selection
         run: |
           set -euo pipefail
           python -m py_compile clip_watcher_v5_1.py
