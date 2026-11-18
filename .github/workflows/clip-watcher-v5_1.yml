@@ -83,8 +83,7 @@ jobs:
       - name: Setup FFmpeg (prebuilt static binaries)
         uses: FedericoCarboni/setup-ffmpeg@v3
         with:
-          ffmpeg-version: "7.1.1"
-          linking-type: static
+          ffmpeg-version: release
 
       - name: Verify media tools
         run: |
