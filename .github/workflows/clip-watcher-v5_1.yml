@@ -102,6 +102,7 @@ jobs:
           name: clipforge-v5-1-${{ inputs.channel }}-${{ github.run_number }}
           path: |
             clips/watcher.log
+            clips/streamlink.log
             clips/_recording_*.ts
             clips/clip_*.mp4
             clips/index.csv
