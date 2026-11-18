@@ -49,7 +49,8 @@ jobs:
           name: v5-2-validation-results
           path: |
             v5-2-validation.log
-            validate-output/
+            validate-output/render-no-face.mp4
+            validate-output/render-face.mp4
           if-no-files-found: warn
           compression-level: 6
           retention-days: 7
