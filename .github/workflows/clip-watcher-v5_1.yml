@@ -111,7 +111,7 @@ jobs:
           python -u clip_watcher_v5_1.py "$CHANNEL" --max-minutes "$MINUTES" --max-clips 3 --out clips --no-effects 2>&1 | tee clips/watcher.log
 
       - name: Upload clip 1
-        if: always()
+        if: always() && inputs.validate_only != true
         uses: actions/upload-artifact@v4
         with:
           name: clip-1
@@ -121,7 +121,7 @@ jobs:
           retention-days: 7
 
       - name: Upload clip 2
-        if: always()
+        if: always() && inputs.validate_only != true
         uses: actions/upload-artifact@v4
         with:
           name: clip-2
@@ -131,7 +131,7 @@ jobs:
           retention-days: 7
 
       - name: Upload clip 3
-        if: always()
+        if: always() && inputs.validate_only != true
         uses: actions/upload-artifact@v4
         with:
           name: clip-3
@@ -153,7 +153,7 @@ jobs:
           retention-days: 7
 
       - name: Validate output and clean temporary source files
-        if: always()
+        if: always() && inputs.validate_only != true
         run: |
           set -e
           COUNT=$(find clips -maxdepth 1 -type f -name 'clip-*.mp4' | wc -l)
