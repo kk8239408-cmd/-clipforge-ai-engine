@@ -1,0 +1,152 @@
+name: Clip Watcher V5 (edited clips)
+
+# Separate from your V3/V4 workflows. Nothing else in the repo is touched.
+# Put this file at: .github/workflows/clip-watcher-v5.yml
+# Put clip_watcher_v5.py in the repository root.
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Twitch channel name (e.g. kaicenat)"
+        required: true
+        type: string
+      minutes:
+        description: "How long to watch (1-330)"
+        required: true
+        default: "10"
+        type: string
+      layout:
+        description: "split = facecam top + gameplay bottom | blur = stream on blurred background | full = tight crop"
+        required: true
+        default: "split"
+        type: choice
+        options:
+          - split
+          - blur
+          - full
+      cam:
+        description: "Facecam box for split: x,y,w,h fractions. Default is a starting estimate; adjust to the streamer's actual facecam."
+        required: false
+        default: "0.72,0.62,0.28,0.38"
+        type: string
+      sfx:
+        description: "Synthetic whoosh + riser/impact timed to the loudest moment"
+        required: false
+        default: true
+        type: boolean
+      music:
+        description: "Add your own royalty-free music from the repo's music/ folder"
+        required: false
+        default: false
+        type: boolean
+      stickers:
+        description: "Keyword-triggered emoji stickers"
+        required: false
+        default: false
+        type: boolean
+      ai_review:
+        description: "Optional CLIP frame scoring (slow CPU install; disabled for the first test)"
+        required: false
+        default: false
+        type: boolean
+      zoom:
+        description: "Zoom strength: 0.5 subtle, 1.0 normal, 1.5 strong"
+        required: false
+        default: "1.0"
+        type: string
+      mult:
+        description: "Spike multiplier (lower = more clips)"
+        required: false
+        default: "2.5"
+        type: string
+      min_count:
+        description: "Min chat score per 10s to count as a spike"
+        required: false
+        default: "10"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install FFmpeg and fonts
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg fonts-montserrat fonts-liberation fonts-noto-color-emoji
+          fc-cache -f
+          ffmpeg -version | head -1
+
+      - name: Install clipping dependencies
+        run: pip install streamlink faster-whisper numpy pillow
+
+      - name: Install optional CLIP scoring (CPU only)
+        if: ${{ inputs.ai_review }}
+        continue-on-error: true
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers
+
+      - name: Validate inputs
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          MINUTES: ${{ inputs.minutes }}
+          ZOOM: ${{ inputs.zoom }}
+          MULT: ${{ inputs.mult }}
+          MIN_COUNT: ${{ inputs.min_count }}
+        run: |
+          python - <<'PY'
+          import os, re
+          assert re.fullmatch(r'[A-Za-z0-9_]+', os.environ['CHANNEL']), 'Invalid Twitch channel name'
+          assert 1 <= float(os.environ['MINUTES']) <= 330, 'Minutes must be 1-330'
+          assert 0 < float(os.environ['ZOOM']) <= 3, 'Zoom must be 0-3'
+          assert float(os.environ['MULT']) > 0 and int(os.environ['MIN_COUNT']) >= 1
+          PY
+
+      - name: Watch stream and make edited clips
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          MINUTES: ${{ inputs.minutes }}
+          LAYOUT: ${{ inputs.layout }}
+          CAM: ${{ inputs.cam }}
+          ZOOM: ${{ inputs.zoom }}
+          MULT: ${{ inputs.mult }}
+          MIN_COUNT: ${{ inputs.min_count }}
+          SFX: ${{ inputs.sfx }}
+          MUSIC: ${{ inputs.music }}
+          STICKERS: ${{ inputs.stickers }}
+          AI: ${{ inputs.ai_review }}
+        run: |
+          ARGS=(--max-minutes "$MINUTES" --layout "$LAYOUT" --cam "$CAM" --zoom "$ZOOM"
+                --mult "$MULT" --min-count "$MIN_COUNT" --font "Montserrat" --out clips)
+          [ "$SFX" = "true" ] && ARGS+=(--sfx)
+          [ "$STICKERS" = "true" ] && ARGS+=(--stickers)
+          [ "$AI" = "true" ] && ARGS+=(--ai-review)
+          if [ "$MUSIC" = "true" ]; then
+            if ls music/*.mp3 music/*.wav music/*.m4a >/dev/null 2>&1; then ARGS+=(--music music);
+            else echo "No files in music/ - continuing without music"; fi
+          fi
+          echo "python clip_watcher_v5.py $CHANNEL ${ARGS[*]}"
+          python clip_watcher_v5.py "$CHANNEL" "${ARGS[@]}"
+
+      - name: Upload clips and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipforge-v5-${{ inputs.channel }}-${{ github.run_number }}
+          path: |
+            clips/clip_*.mp4
+            clips/index.csv
+          if-no-files-found: warn
+          retention-days: 7
+          
