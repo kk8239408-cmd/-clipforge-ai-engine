@@ -135,134 +135,286 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
     with open(ass,"w",encoding="utf-8") as f: f.write(head+"\n".join(rows)+"\n")
     return len(words)
 
-def render_clip(segment_paths, out, clip_no):
-    concat=os.path.join(os.path.dirname(out),"render_concat.txt")
+
+KEYWORDS = {"LUL":2,"OMEGALUL":3,"W":1,"L":1,"WTF":2,"CLIP IT":4,"NO WAY":3,"BRO":1,"WHAT":1}
+REACTION_WORDS = {"NO WAY":4,"WHAT":2,"BRO":1,"WTF":3,"INSANE":3,"HOLY":3,"F***":2,"FUCK":2,"SHIT":2,"CLIP":2,"OMG":3,"LET'S GO":2}
+
+def parse_chat_features(channel, since):
+    now=time.time()
+    with channel.lock:
+        rows=[(t,b.decode("utf-8","ignore")) for t,b in channel.items if since<=t<=now]
+    names=set(); emote_hits=0; keyword_hits=0
+    for _,line in rows:
+        m=re.match(r":([^! ]+)!.* PRIVMSG ",line)
+        if m: names.add(m.group(1).lower())
+        upper=line.upper()
+        emote_hits += sum(upper.count(k) for k in ("LUL","OMEGALUL"," KAPPA"," POG"," KEKW"," W "))
+        keyword_hits += sum(upper.count(k) for k in KEYWORDS)
+    return len(rows),len(names),emote_hits,keyword_hits
+
+def frame_features(path):
+    cap=cv2.VideoCapture(path)
+    if not cap.isOpened(): return {"luma":0,"motion":0,"scene":0,"face":0}
+    prev=None; motions=[]; lumas=[]; scenes=[]; face_sizes=[]
+    cascade=cv2.CascadeClassifier(cv2.data.haarcascades+"haarcascade_frontalface_default.xml")
+    frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    for pos in np.linspace(0,max(0,frames-1),min(8,max(2,frames//15+1))):
+        cap.set(cv2.CAP_PROP_POS_FRAMES,int(pos)); ok,fr=cap.read()
+        if not ok: continue
+        small=cv2.resize(fr,(160,90)); gray=cv2.cvtColor(small,cv2.COLOR_BGR2GRAY)
+        lumas.append(float(gray.mean()))
+        if prev is not None:
+            d=cv2.absdiff(gray,prev); motions.append(float(d.mean()))
+            scenes.append(float(np.mean(d>35)))
+        prev=gray
+        g=cv2.cvtColor(fr,cv2.COLOR_BGR2GRAY)
+        faces=cascade.detectMultiScale(g,scaleFactor=1.1,minNeighbors=4,minSize=(30,30))
+        if len(faces): face_sizes.append(max(b[2]*b[3] for b in faces)/(g.shape[0]*g.shape[1]))
+    cap.release()
+    return {"luma":float(np.mean(lumas)) if lumas else 0,
+            "motion":float(np.mean(motions)) if motions else 0,
+            "scene":float(max(scenes)) if scenes else 0,
+            "face":float(np.std(face_sizes)) if len(face_sizes)>1 else 0}
+
+def transcribe_words(path):
+    from faster_whisper import WhisperModel
+    model=WhisperModel("base",device="cpu",compute_type="int8")
+    segs,_=model.transcribe(path,word_timestamps=True,vad_filter=True)
+    words=[]
+    for s in segs:
+        for w in (s.words or []):
+            if w.word.strip(): words.append({"start":float(w.start),"end":float(w.end),"word":w.word.strip()})
+    return words
+
+def score_candidate(path, stats, audio_values, baseline_loud):
+    reasons=[]; chat=stats["chat"]; unique=stats["unique"]; emotes=stats["emotes"]; keywords=stats["keywords"]
+    chat_ratio=chat/max(1,stats["baseline"])
+    chat_pts=min(16,max(0,(chat_ratio-1)*8))
+    unique_pts=min(8,unique*1.2)
+    burst_pts=min(10,emotes*1.5+keywords*1.2)
+    if chat_pts>=3: reasons.append("chat spike")
+    if unique_pts>=3: reasons.append("unique chatters")
+    if burst_pts>=3: reasons.append("emote/keyword burst")
+    loud=audio_values["loud"]; jump=loud-baseline_loud
+    peak_pts=min(12,max(0,jump)*1.1)
+    if peak_pts>=2: reasons.append("audio peak/shout")
+    if audio_values["silence_reaction"]: peak_pts=min(14,peak_pts+4); reasons.append("silence-to-reaction")
+    if audio_values["laughter"]: reasons.append("possible laughter (audio peak pattern)")
+    motion=stats["motion"]
+    motion_pts=min(10,max(0,motion-1.0)*1.8)
+    scene_pts=min(6,stats["scene"]*12)
+    if motion_pts>=2: reasons.append("motion burst")
+    if scene_pts>=2: reasons.append("scene change")
+    face_pts=min(5,stats["face"]*500)
+    if face_pts>=1: reasons.append("facecam expression/face-box change proxy")
+    words=transcribe_words(path)
+    text=" ".join(w["word"] for w in words).upper()
+    hook_hits=[k for k in REACTION_WORDS if k in text]
+    transcript_pts=min(12,sum(REACTION_WORDS[k] for k in hook_hits))
+    if hook_hits: reasons.append("transcript hooks: "+", ".join(hook_hits[:5]))
+    # Hook score: strongest reaction must occur in the first three seconds.
+    hook_words=[w for w in words if w["start"]<=3.0]
+    hook_text=" ".join(w["word"] for w in hook_words).upper()
+    hook_hits3=[k for k in REACTION_WORDS if k in hook_text]
+    hook_score=min(100,35+sum(REACTION_WORDS[k]*12 for k in hook_hits3)) if hook_hits3 else min(45,len(hook_words)*7)
+    if hook_score<50: reasons.append("weak opening hook")
+    score=min(100,round(chat_pts+unique_pts+burst_pts+peak_pts+motion_pts+scene_pts+face_pts+transcript_pts+hook_score*.25))
+    if len(words)<8:
+        score=max(0,score-12); reasons.append("under 8 transcript words (-12)")
+    if stats["luma"]<18: score=max(0,score-30); reasons.append("very dark/near-black")
+    if stats["motion"]<0.35 and stats["scene"]<0.03: score=max(0,score-35); reasons.append("static footage")
+    return score,hook_score,reasons,words
+
+def extract_candidate(paths, out):
+    concat=out+".concat.txt"; joined=out+".joined.ts"; src=out+".candidate.mp4"
     with open(concat,"w",encoding="utf-8") as f:
-        for p in segment_paths: f.write("file '%s'\n"%os.path.abspath(p).replace("'","'\\''"))
-    joined=out+".joined.ts"
+        for p in paths: f.write("file '%s'\\n"%os.path.abspath(p).replace("'","'\\''"))
     p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","concat","-safe","0","-i",concat,"-c","copy",joined],capture_output=True,text=True)
-    if p.returncode: raise RuntimeError("segment concat failed: "+p.stderr[-700:])
-    src=out+".src.mp4"
-    p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-ss","10" if len(segment_paths)>=4 else "0","-i",joined,"-t","30","-map","0:v:0","-map","0:a:0?","-c","copy",src],capture_output=True,text=True)
-    if p.returncode: raise RuntimeError("clip extraction failed: "+p.stderr[-700:])
-    info=probe(src)
-    if info.get("duration",0)<24: raise RuntimeError("assembled event shorter than 24 seconds")
-    face=detect_face_crop(src)
-    ass=out+".ass"; words=make_captions(src,ass)
-    if face:
-        x,y,w,h=face
-        top="crop=w='trunc(iw*%.6f/2)*2':h='trunc(ih*%.6f/2)*2':x='trunc(iw*%.6f/2)*2':y='trunc(ih*%.6f/2)*2'"%(w,h,x,y)
-    else: top="scale=720:640:force_original_aspect_ratio=increase,crop=720:640"
-    graph="[0:v]split=2[a][b];[a]%s,scale=720:640:force_original_aspect_ratio=increase,crop=720:640[top];[b]scale=720:640:force_original_aspect_ratio=increase,crop=720:640[bottom];[top][bottom]vstack,drawbox=x=0:y=637:w=720:h=6:color=black:t=fill,subtitles=%s,format=yuv420p[v]"%(top,ass)
-    cmd=["ffmpeg","-y","-hide_banner","-loglevel","error","-i",src,"-filter_complex",graph,"-map","[v]"]
-    if info.get("audio"): cmd += ["-map","0:a:0","-c:a","aac","-b:a","128k","-ar","48000"]
-    cmd += ["-c:v","libx264","-preset","veryfast","-crf","24","-r","30","-fps_mode","cfr","-t","30","-pix_fmt","yuv420p","-movflags","+faststart",out]
-    p=run(cmd,capture_output=True,text=True)
-    if p.returncode: raise RuntimeError("render failed: "+p.stderr[-1200:])
-    result=probe(out); size=os.path.getsize(out)
-    if (result.get("width"),result.get("height"))!=(720,1280): raise RuntimeError("ffprobe wrong dimensions: %s"%result)
-    if not result.get("audio"): raise RuntimeError("ffprobe says audio is missing")
-    if abs(result.get("fps",0)-30)>.2: raise RuntimeError("ffprobe says output is not 30fps")
-    log("[render] clip-%d | bytes=%d (%.2f MB) | ffprobe=%s | captions=%d"%(clip_no,size,size/1048576,result,words))
-    if size>40*1024*1024: log("[WARN] clip-%d exceeds 40 MB"%(clip_no))
-    for pth in (concat,joined,src,ass):
-        try: os.remove(pth)
+    if p.returncode: raise RuntimeError("candidate concat failed: "+p.stderr[-500:])
+    # Three 10-second chunks: 20s before trigger end + 5s after it.
+    p=run(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",joined,"-t","25","-map","0:v:0","-map","0:a:0?","-c","copy",src],capture_output=True,text=True)
+    if p.returncode: raise RuntimeError("candidate trim failed: "+p.stderr[-500:])
+    for x in (concat,joined):
+        try: os.remove(x)
         except OSError: pass
+    return src
+
+def render_ranked_clip(src, out):
+    info=probe(src)
+    if info.get("duration",0)<15: raise RuntimeError("candidate shorter than 15s")
+    face=detect_face_crop(src)
+    ass=out+".ass"
+    words=transcribe_words(src)
+    if not words: raise RuntimeError("Faster-Whisper produced no word timestamps")
+    log("[captions] "+os.path.basename(out)+" word_timestamps="+str(len(words)))
+    head="""[Script Info]
+ScriptType: v4.00+
+PlayResX: 720
+PlayResY: 1280
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: Default,Arial,58,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,7,3,5,10,10,0,1
+[Events]
+Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+"""
+    colors=["&H00FFFF00&","&H0000FFFF&","&H0000FF00&"]; rows=[]
+    for i,w in enumerate(words):
+        st=w["start"]; en=max(st+.12,min(words[i+1]["start"] if i+1<len(words) else w["end"]+.25,w["end"]+.25))
+        rows.append("Dialogue: 0,%s,%s,Default,,0,0,0,,{\\c%s\\bord8\\shad3\\b1}%s"%(ass_time(st),ass_time(en),colors[i%3],w["word"].upper().strip(",.!?;:")))
+    with open(ass,"w",encoding="utf-8") as f: f.write(head+"\\n".join(rows)+"\\n")
+    x,y,w,h=face if face else (0,0,1,1)
+    # Top is the detected face. Bottom uses a gameplay crop shifted away from the detected face box.
+    if face:
+        top="crop=w='trunc(iw*%.6f/2)*2':h='trunc(ih*%.6f/2)*2':x='trunc(iw*%.6f/2)*2':y='trunc(ih*%.6f/2)*2'"%(w,h,x,y)
+        # Exclude the facecam rectangle by choosing the opposite horizontal side when possible.
+        bx=0.0 if x>0.45 else min(0.35,max(0.0,x+w))
+        bottom="crop=w='trunc(iw*0.62/2)*2':h='trunc(ih*0.62/2)*2':x='trunc(iw*%.4f/2)*2':y='trunc(ih*0.20/2)*2'"%bx
+    else:
+        top="scale=720:640:force_original_aspect_ratio=increase,crop=720:640"
+        bottom="scale=720:640:force_original_aspect_ratio=increase,crop=720:640"
+    # Brighten only genuinely dark source footage.
+    brightness=",eq=brightness=0.06:contrast=1.03" if info.get("duration",0) and frame_features(src)["luma"]<35 else ""
+    graph="[0:v]split=2[a][b];[a]%s,scale=720:640:force_original_aspect_ratio=increase,crop=720:640[top];[b]%s%s,scale=720:640:force_original_aspect_ratio=increase,crop=720:640[bottom];[top][bottom]vstack,drawbox=x=0:y=637:w=720:h=6:color=black:t=fill,subtitles=%s:force_style='MarginV=35',format=yuv420p[v]"%(top,bottom,brightness,ass)
+    cmd=["ffmpeg","-y","-hide_banner","-loglevel","error","-i",src,"-filter_complex",graph,"-map","[v]","-map","0:a:0?","-c:v","libx264","-preset","veryfast","-crf","25","-r","30","-fps_mode","cfr","-t","25","-c:a","aac","-b:a","128k","-movflags","+faststart",out]
+    p=run(cmd,capture_output=True,text=True)
+    if p.returncode: raise RuntimeError("render failed: "+p.stderr[-1000:])
+    result=probe(out); size=os.path.getsize(out)
+    if result.get("duration",0)<15 or result.get("duration",0)>25.5: raise RuntimeError("duration outside 15-25s: "+str(result))
+    if (result.get("width"),result.get("height"))!=(720,1280) or not result.get("audio") or abs(result.get("fps",0)-30)>.2: raise RuntimeError("output probe failed: "+str(result))
+    log("[render] "+os.path.basename(out)+" bytes=%d size_mib=%.2f ffprobe=%s words=%d"%(size,size/1048576,result,len(words)))
+    if size>40*1024*1024: log("[WARN] output exceeds 40 MiB")
+    os.remove(ass)
+    return {"duration":result["duration"],"bytes":size,"words":len(words)}
+
 
 def main():
     ap=argparse.ArgumentParser()
-    ap.add_argument("channel"); ap.add_argument("--max-minutes",type=int,default=4); ap.add_argument("--max-clips",type=int,default=3); ap.add_argument("--out",default="clips"); ap.add_argument("--no-effects",action="store_true")
+    ap.add_argument("channel",nargs="?",default="xqc")
+    ap.add_argument("--max-minutes",type=int,default=4)
+    ap.add_argument("--max-clips",type=int,default=3)
+    ap.add_argument("--threshold",type=int,default=70)
+    ap.add_argument("--out",default="clips")
+    ap.add_argument("--no-effects",action="store_true")
     a=ap.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9_]+",a.channel): raise SystemExit("invalid channel")
     if not 3<=a.max_minutes<=5: raise SystemExit("duration must be 3-5 minutes")
     os.makedirs(a.out,exist_ok=True); buf=os.path.join(a.out,"buffer"); os.makedirs(buf,exist_ok=True)
-    log("[thresholds] chat_spike_multiplier=%.2f minimum_chat_score=%d loudness_jump_db=%.1f cooldown=%ds"%(CHAT_SPIKE_MULTIPLIER,MIN_CHAT_SCORE,LOUDNESS_JUMP_DB,COOLDOWN_SECONDS))
-    chat=TwitchChat(a.channel); chat.start()
-    url="https://twitch.tv/"+a.channel
-    check=run(["streamlink","--stream-url",url,"best"],capture_output=True,text=True,timeout=60)
-    if check.returncode: raise SystemExit("[streamlink] access failed: "+(check.stderr or check.stdout)[-400:])
-    log("[streamlink] access OK; starting 10-second segmented stream")
+    log("[config] requested_streamer="+a.channel+" threshold="+str(a.threshold)+" max_exports="+str(a.max_clips))
+    selected=a.channel.lower()
+    def stream_check(ch):
+        return run(["streamlink","--stream-url","https://twitch.tv/"+ch,"best"],capture_output=True,text=True,timeout=60)
+    check=stream_check(selected)
+    if check.returncode and selected=="xqc":
+        log("[streamer] xQc offline/unavailable; trying Lacy fallback")
+        fallback=stream_check("lacy")
+        if fallback.returncode: raise SystemExit("[streamlink] xQc and Lacy unavailable")
+        selected="lacy"; check=fallback
+    elif check.returncode:
+        raise SystemExit("[streamlink] requested channel unavailable: "+(check.stderr or check.stdout)[-300:])
+    log("[streamer] using="+selected)
+    chat=TwitchChat(selected); chat.start()
+    url="https://twitch.tv/"+selected
     streamlog=open(os.path.join(a.out,"streamlink.stderr.log"),"w")
     sl=subprocess.Popen(["streamlink","--stdout",url,"best"],stdout=subprocess.PIPE,stderr=streamlog)
-    pattern=os.path.join(buf,"segment_%06d.ts")
-    ff=subprocess.Popen(["ffmpeg","-y","-hide_banner","-loglevel","warning","-i","pipe:0","-map","0","-c","copy","-f","segment","-segment_time",str(SEGMENT_SECONDS),"-reset_timestamps","1","-segment_format","mpegts",pattern],stdin=sl.stdout,stdout=subprocess.DEVNULL,stderr=streamlog)
+    ff=subprocess.Popen(["ffmpeg","-y","-hide_banner","-loglevel","warning","-i","pipe:0","-map","0","-c","copy","-f","segment","-segment_time",str(SEGMENT_SECONDS),"-reset_timestamps","1","-segment_format","mpegts",os.path.join(buf,"segment_%06d.ts")],stdin=sl.stdout,stdout=subprocess.DEVNULL,stderr=streamlog)
     sl.stdout.close()
-    start=time.time(); deadline=start+a.max_minutes*60; processed_ids=set(); scores=[]; recent_chat=[]; loud_hist=[]; motion_hist=[]; triggered=[]; last_trigger=-999; made=0
-    log("[buffer] rolling retention=%ds segment=%ds; clip window=20s pre +10s post"%(BUFFER_SECONDS,SEGMENT_SECONDS))
+    start=time.time(); deadline=start+a.max_minutes*60; seen=set(); candidates=[]; chat_hist=[]; loud_hist=[]; prev_loud=-60.0
+    log("[buffer] RECORD EVERYTHING; retention=%ds chunk=%ds"%(BUFFER_SECONDS,SEGMENT_SECONDS))
+    log("[score] every closed 10s segment; export threshold=%d/100"%a.threshold)
     try:
         while time.time()<deadline and ff.poll() is None:
-            time.sleep(1)
+            time.sleep(.8)
             files=sorted(glob.glob(os.path.join(buf,"segment_*.ts")))
-            # Newest chunk is still being written; score only closed segments.
             for seg in files[:-1]:
-                match=re.search(r"segment_(\d+)\.ts$",seg)
-                if not match: continue
-                idx=int(match.group(1))
-                if idx in processed_ids: continue
-                processed_ids.add(idx)
-                time.sleep(.15)
-                count=chat.count(time.time()-SEGMENT_SECONDS-1)
-                recent_chat.append(count); baseline=float(np.mean(recent_chat[-6:-1])) if len(recent_chat)>1 else float(count)
-                loud=audio_loudness(seg); motion=motion_score(seg)
-                prev_loud=float(np.mean(loud_hist[-5:])) if loud_hist else loud
-                loud_jump=loud-prev_loud
-                loud_hist.append(loud); motion_hist.append(motion)
-                chat_trigger=count>=max(MIN_CHAT_SCORE,baseline*CHAT_SPIKE_MULTIPLIER)
-                audio_trigger=loud_jump>=LOUDNESS_JUMP_DB
-                motion_base=float(np.mean(motion_hist[-5:])) if len(motion_hist)>1 else motion
-                motion_trigger=motion>=max(2.0,motion_base*1.35)
-                score=(count/max(1,baseline+1))+max(0,loud_jump)*.6+max(0,motion-motion_base)*.15
-                scores.append({"idx":idx,"score":score,"chat":count,"loud":loud,"loud_jump":loud_jump,"motion":motion,"chat_trigger":chat_trigger,"audio_trigger":audio_trigger,"motion_trigger":motion_trigger,"file":seg})
-                log("[score] t=%ds chat=%d baseline=%.1f loud=%.1fdB jump=%.1fdB motion=%.2f score=%.2f trigger=%s"%(idx*10,count,baseline,loud,loud_jump,motion,score,chat_trigger or audio_trigger or motion_trigger))
-                # Keep rolling 3-minute buffer; preserve segments referenced by pending events.
+                m=re.search(r"segment_(\d+)\.ts$",seg)
+                if not m: continue
+                idx=int(m.group(1))
+                if idx in seen: continue
+                seen.add(idx); time.sleep(.12)
+                now=time.time(); count,unique,emotes,keywords=parse_chat_features(chat,now-SEGMENT_SECONDS-1)
+                baseline=float(np.mean(chat_hist[-6:])) if chat_hist else max(1,count)
+                chat_hist.append(count)
+                loud=audio_loudness(seg); jump=loud-prev_loud; prev_loud=loud
+                motion=motion_score(seg)
+                fftr=frame_features(seg)
+                audio={"loud":loud,"silence_reaction":bool(loud_hist and min(loud_hist[-3:])<-42 and jump>7),"laughter":bool(jump>5 and motion>1.2)}
+                loud_hist.append(loud)
+                fired=(count>=max(5,baseline*1.35) or jump>=3 or motion>=2)
+                log("[moment] t=%ds chat=%d unique=%d emotes=%d keywords=%d loud=%.1fdB jump=%.1f motion=%.2f luma=%.1f trigger=%s"%(idx*10,count,unique,emotes,keywords,loud,jump,motion,fftr["luma"],fired))
+                # Record every moment as a candidate; trigger moments get a 25s exact buffer window.
+                if fired and idx>=1:
+                    ids=[idx-1,idx,idx+1]
+                    candidates.append({"idx":idx,"ids":ids,"chat":count,"unique":unique,"emotes":emotes,"keywords":keywords,"baseline":baseline,"loud":loud,"jump":jump,"motion":motion,"scene":fftr["scene"],"face":fftr["face"],"luma":fftr["luma"],"silence_reaction":audio["silence_reaction"],"laughter":audio["laughter"]})
                 cutoff=max(0,idx-(BUFFER_SECONDS//SEGMENT_SECONDS)+1)
                 for old in glob.glob(os.path.join(buf,"segment_*.ts")):
-                    m=re.search(r"segment_(\d+)\.ts$",old)
-                    if m and int(m.group(1))<cutoff and all(int(m.group(1)) not in e["indices"] for e in triggered): 
+                    om=re.search(r"segment_(\d+)\.ts$",old)
+                    if om and int(om.group(1))<cutoff and not any(int(om.group(1)) in c["ids"] for c in candidates):
                         try: os.remove(old)
                         except OSError: pass
-                fired=chat_trigger or audio_trigger or motion_trigger
-                if fired and idx*10-last_trigger>=COOLDOWN_SECONDS and made+len(triggered)<a.max_clips:
-                    prior_ids=[idx-2,idx-1,idx]
-                    if all(any(s["idx"]==n for s in scores) for n in prior_ids):
-                        event={"indices":prior_ids+[idx+1],"score":score,"trigger_idx":idx,"chat":count}
-                        triggered.append(event); last_trigger=idx*10
-                        log("[trigger] idx=%d score=%.2f captured_segments=%s; waiting for 10s post-roll"%(idx,score,event["indices"]))
-                # Once a full post-roll segment exists, assemble the selected 3 prior + 1 after.
-                ready=[e for e in triggered if idx>=e["trigger_idx"]+1]
-                for e in ready:
-                    if made>=a.max_clips: break
-                    paths=[os.path.join(buf,"segment_%06d.ts"%i) for i in e["indices"]]
-                    if all(os.path.isfile(p) and os.path.getsize(p)>1000 for p in paths):
-                        made+=1; out=os.path.join(a.out,"clip-%d.mp4"%made)
-                        try: render_clip(paths,out,made)
-                        except Exception as ex: made-=1; log("[render-error] "+str(ex))
-                    else: log("[trigger] skipped: required roll segments unavailable")
-                    triggered.remove(e)
+                # Score candidate once its post-roll chunk has closed.
+                for c in list(candidates):
+                    if not c.get("scored") and idx>=c["idx"]+1:
+                        paths=[os.path.join(buf,"segment_%06d.ts"%i) for i in c["ids"]]
+                        if not all(os.path.isfile(p) and os.path.getsize(p)>1000 for p in paths):
+                            c["score"]=0; c["hook_score"]=0; c["reasons"]=["missing buffer segment"]; c["scored"]=True; continue
+                        tmp=os.path.join(a.out,"candidate-%d.mp4"%c["idx"])
+                        try:
+                            src=extract_candidate(paths,tmp)
+                            score,hook,reasons,words=score_candidate(src,c,{"loud":c["loud"],"silence_reaction":c["silence_reaction"],"laughter":c["laughter"]},-42)
+                            c.update({"score":score,"hook_score":hook,"reasons":reasons,"candidate_words":len(words),"scored":True,"src":src})
+                            log("[candidate] t=%ds score=%d hook=%d words=%d reasons=%s"%(c["idx"]*10,score,hook,len(words),"; ".join(reasons)))
+                        except Exception as ex:
+                            c.update({"score":0,"hook_score":0,"reasons":["scoring failed: "+str(ex)[:100]],"scored":True})
+                            log("[candidate-error] "+str(ex)[:200])
                 if time.time()>=deadline: break
-        # Let the segment muxer close the last chunk, then stop child processes.
+        # Stop writers, then process any final candidate whose post-roll is already present.
     finally:
         for proc in (ff,sl):
             if proc.poll() is None: proc.terminate()
         for proc in (ff,sl):
             try: proc.wait(timeout=8)
             except subprocess.TimeoutExpired: proc.kill()
-        streamlog.close()
-        chat.stop_flag=True
-    # If no trigger produced a clip, use the highest score from the rolling score log.
-    if made==0 and scores:
-        best=max(scores,key=lambda x:x["score"])
-        log("[fallback] no trigger clip rendered; highest score idx=%d score=%.2f"% (best["idx"],best["score"]))
-        available=sorted(glob.glob(os.path.join(buf,"segment_*.ts")))
-        all_by_idx={int(re.search(r"segment_(\d+)\.ts$",p).group(1)):p for p in available}
-        ids=[best["idx"]-2,best["idx"]-1,best["idx"],best["idx"]+1]
-        if min(ids)<0 or any(i not in all_by_idx for i in ids):
-            ids=sorted(all_by_idx)[-4:]
-        paths=[all_by_idx[i] for i in ids if i in all_by_idx]
-        if len(paths)>=3:
-            try: made=1; render_clip(paths,os.path.join(a.out,"clip-1.mp4"),1)
-            except Exception as e: made=0; log("[fallback-render-error] "+str(e))
+        streamlog.close(); chat.stop_flag=True
+    # One final scoring pass for candidates with complete source chunks.
+    available={int(re.search(r"segment_(\d+)\.ts$",p).group(1)):p for p in glob.glob(os.path.join(buf,"segment_*.ts"))}
+    for c in candidates:
+        if c.get("scored"): continue
+        paths=[available.get(i) for i in c["ids"]]
+        if all(paths):
+            try:
+                src=extract_candidate(paths,os.path.join(a.out,"candidate-%d.mp4"%c["idx"]))
+                score,hook,reasons,words=score_candidate(src,c,{"loud":c["loud"],"silence_reaction":c["silence_reaction"],"laughter":c["laughter"]},-42)
+                c.update({"score":score,"hook_score":hook,"reasons":reasons,"candidate_words":len(words),"scored":True,"src":src})
+            except Exception as ex: c.update({"score":0,"hook_score":0,"reasons":["scoring failed: "+str(ex)[:100]],"scored":True})
+    ranked=sorted([c for c in candidates if c.get("scored")],key=lambda c:c.get("score",0),reverse=True)
+    log("[ranking] rank | timestamp | score/100 | hook | reasons")
+    for rank,c in enumerate(ranked,1): log("[ranking] %d | %ds | %d | %d | %s"%(rank,c["idx"]*10,c["score"],c["hook_score"],"; ".join(c["reasons"])))
+    passed=[c for c in ranked if c.get("score",0)>=a.threshold]
+    low_fallback=False
+    if not passed and ranked: passed=ranked[:1]; low_fallback=True; log("[fallback] no candidate met threshold; exporting single best LOW-RATED candidate")
+    chosen=[]; used=set()
+    for c in passed:
+        if c["idx"] in used: continue
+        # Suppress near-duplicate candidate moments within 25 seconds.
+        if any(abs(c["idx"]-x["idx"])<3 for x in chosen): continue
+        chosen.append(c); used.add(c["idx"])
+        if len(chosen)>=min(3,a.max_clips): break
+    summary={"score_is":"heuristic estimate, not a prediction of views","threshold":a.threshold,"low_rated_fallback":low_fallback,"streamer_requested":a.channel,"streamer_used":selected,"candidates_found":len(candidates),"ranked_candidates":[],"exports":[]}
+    for rank,c in enumerate(ranked,1):
+        summary["ranked_candidates"].append({"rank":rank,"timestamp_seconds":c["idx"]*10,"score":c.get("score",0),"hook_score":c.get("hook_score",0),"reasons":c.get("reasons",[])})
+    for n,c in enumerate(chosen,1):
+        src=c.get("src")
+        if not src: continue
+        name="clip-%d_score%d.mp4"%(n,c["score"]); out=os.path.join(a.out,name)
+        try:
+            details=render_ranked_clip(src,out)
+            summary["exports"].append({"file":name,"score":c["score"],"timestamp_seconds":c["idx"]*10,"hook_score":c["hook_score"],"reasons":c["reasons"],**details,"low_rated":low_fallback})
+        except Exception as ex: log("[export-error] "+name+": "+str(ex)[:250])
+    with open(os.path.join(a.out,"summary.json"),"w",encoding="utf-8") as f: json.dump(summary,f,indent=2)
+    for p in glob.glob(os.path.join(a.out,"candidate-*")):
+        try: os.remove(p)
+        except OSError: pass
     total_bytes=sum(os.path.getsize(p) for p in glob.glob(os.path.join(buf,"*.ts")))
-    log("[summary] scores=%d clips=%d IRC_messages=%d buffer_bytes=%d"%(len(scores),made,chat.total(),total_bytes))
-    if made<1: raise SystemExit("[ERROR] no clips rendered")
+    log("[summary] candidates=%d exported=%d IRC_messages=%d buffer_bytes=%d low_rated_fallback=%s"%(len(candidates),len(summary["exports"]),chat.total(),total_bytes,low_fallback))
+    if not summary["exports"]: raise SystemExit("[ERROR] no valid clips exported")
 if __name__=="__main__": main()
