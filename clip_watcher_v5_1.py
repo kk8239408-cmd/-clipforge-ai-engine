@@ -305,11 +305,19 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
         bottom="scale=720:640:force_original_aspect_ratio=increase,crop=720:640"
     # Brighten only genuinely dark source footage.
     brightness=",eq=brightness=0.06:contrast=1.03" if info.get("duration",0) and frame_features(src)["luma"]<35 else ""
-    mask=""
+    # Build each chain from non-empty filters only; no-face uses explicit full-frame fallback.
+    top_filters=[top,"scale=720:640:force_original_aspect_ratio=increase","crop=720:640"]
+    bottom_filters=[]
     if face:
         fx,fy,fw,fh=face
-        mask=",drawbox=x=iw*%.5f:y=ih*%.5f:w=iw*%.5f:h=ih*%.5f:color=black:t=fill"%(fx,fy,fw,fh)
-    graph="[0:v]split=2[a][b];[a]%s,scale=720:640:force_original_aspect_ratio=increase,crop=720:640[top];[b]%s%s%s,scale=720:640:force_original_aspect_ratio=increase,crop=720:640[bottom];[top][bottom]vstack,drawbox=x=0:y=637:w=720:h=6:color=black:t=fill,subtitles=%s:force_style=MarginV=35,format=yuv420p[v]"%(top,mask,bottom,brightness,ass)
+        bottom_filters.append("drawbox=x=iw*%.5f:y=ih*%.5f:w=iw*%.5f:h=ih*%.5f:color=black:t=fill"%(fx,fy,fw,fh))
+    bottom_filters.extend([bottom,"scale=720:640:force_original_aspect_ratio=increase","crop=720:640"])
+    if brightness:
+        top_filters.append(brightness.lstrip(","))
+        bottom_filters.append(brightness.lstrip(","))
+    final_filters=["vstack","drawbox=x=0:y=637:w=720:h=6:color=black:t=fill","subtitles=%s:force_style=MarginV=35"%ass,"format=yuv420p"]
+    graph="[0:v]split=2[a][b];[a]%s[top];[b]%s[bottom];[top][bottom]%s[v]"%(",".join(x for x in top_filters if x.strip()),",".join(x for x in bottom_filters if x.strip()),",".join(x for x in final_filters if x.strip()))
+    if ",," in graph or graph.endswith(","): raise RuntimeError("empty FFmpeg filter in graph: "+graph)
     cmd=["ffmpeg","-y","-hide_banner","-loglevel","error","-i",src,"-filter_complex",graph,"-map","[v]","-map","0:a:0?","-c:v","libx264","-preset","veryfast","-crf","25","-r","30","-fps_mode","cfr","-t","25","-c:a","aac","-b:a","128k","-movflags","+faststart",out]
     p=run(cmd,capture_output=True,text=True)
     if p.returncode: raise RuntimeError("render failed: "+p.stderr[-1000:])
@@ -426,7 +434,7 @@ def main():
     url="https://twitch.tv/"+selected
     streamlog=open(os.path.join(a.out,"streamlink.stderr.log"),"w")
     sl=subprocess.Popen(["streamlink","--stdout",url,"best"],stdout=subprocess.PIPE,stderr=streamlog)
-    ff=subprocess.Popen(["ffmpeg","-y","-hide_banner","-loglevel","warning","-i","pipe:0","-map","0","-c","copy","-f","segment","-segment_time",str(SEGMENT_SECONDS),"-reset_timestamps","1","-segment_format","mpegts",os.path.join(buf,"segment_%06d.ts")],stdin=sl.stdout,stdout=subprocess.DEVNULL,stderr=streamlog)
+    ff=subprocess.Popen(["ffmpeg","-y","-hide_banner","-loglevel","error","-i","pipe:0","-map","0","-c","copy","-f","segment","-segment_time",str(SEGMENT_SECONDS),"-reset_timestamps","1","-segment_format","mpegts",os.path.join(buf,"segment_%06d.ts")],stdin=sl.stdout,stdout=subprocess.DEVNULL,stderr=streamlog)
     sl.stdout.close()
     start=time.time(); deadline=start+a.max_minutes*60; seen=set(); candidates=[]; chat_hist=[]; loud_hist=[]; prev_loud=-60.0
     log("[buffer] RECORD EVERYTHING; retention=%ds chunk=%ds"%(BUFFER_SECONDS,SEGMENT_SECONDS))
