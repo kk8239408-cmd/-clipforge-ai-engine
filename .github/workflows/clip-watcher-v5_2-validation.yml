@@ -34,9 +34,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.cache/clipforge-ffmpeg"
-          curl -fsSL --retry 3 --connect-timeout 15 \
-            https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \\
-            -o /tmp/clipforge-ffmpeg.tar.xz
+          curl -fsSL --retry 3 --connect-timeout 15 --output /tmp/clipforge-ffmpeg.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
           tar -xJf /tmp/clipforge-ffmpeg.tar.xz -C /tmp
           ffdir="$(find /tmp -maxdepth 1 -type d -name 'ffmpeg-*-amd64-static' -print -quit)"
           test -n "$ffdir"
