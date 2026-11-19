@@ -1,0 +1,50 @@
+name: ClipForge YouTube V1 Validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'clip_youtube_v1.py'
+      - '.github/workflows/clip-youtube-v1.yml'
+      - '.github/workflows/clip-youtube-v1-validation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install FFmpeg static build (target about 24 seconds)
+        run: |
+          set -e
+          mkdir -p "$HOME/ff"
+          ARCHIVE="/tmp/ffmpeg-master-latest-linux64-gpl.tar.xz"
+          URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+          START=$SECONDS
+          curl -fL --retry 3 --retry-delay 1 --connect-timeout 15 "$URL" -o "$ARCHIVE"
+          test "$(stat -c%s "$ARCHIVE")" -gt 50000000
+          xz -t "$ARCHIVE"
+          tar -xJf "$ARCHIVE" --strip-components=2 -C "$HOME/ff" --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
+          test -x "$HOME/ff/ffmpeg"
+          test -x "$HOME/ff/ffprobe"
+          echo "$HOME/ff" >> "$GITHUB_PATH"
+          echo "FFMPEG_INSTALL_SECONDS=$((SECONDS-START))"
+      - name: Verify and compile
+        run: |
+          set -e
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+          python -m py_compile clip_youtube_v1.py
+          echo "PYTHON_COMPILE=PASS"
+          python - <<'PY'
+          import ast
+          ast.parse(open("clip_youtube_v1.py", encoding="utf-8").read())
+          print("AST_PARSE=PASS")
+          PY
