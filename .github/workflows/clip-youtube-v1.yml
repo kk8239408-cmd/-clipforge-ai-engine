@@ -55,7 +55,7 @@ jobs:
           echo "FFMPEG_INSTALL_SECONDS=$((SECONDS-START))"
       - name: Verify tools and Gemini key
         env:
-          AI_KEY: \${{ secrets.CLIPFORGE_VISION_API_KEY }}
+          AI_KEY: ${{ secrets.CLIPFORGE_VISION_API_KEY }}
         run: |
           set -e
           command -v ffmpeg
@@ -64,11 +64,11 @@ jobs:
           test -n "$AI_KEY" || (echo "Add CLIPFORGE_VISION_API_KEY in GitHub Actions secrets." && exit 1)
       - name: Run YouTube AI clipper
         env:
-          CLIPFORGE_VISION_API_KEY: \${{ secrets.CLIPFORGE_VISION_API_KEY }}
+          CLIPFORGE_VISION_API_KEY: ${{ secrets.CLIPFORGE_VISION_API_KEY }}
           CLIPFORGE_VISION_MODEL: gemini-2.5-flash
         run: |
           mkdir -p youtube-clips
-          python -u clip_youtube_v1.py --url "\${{ inputs.youtube_url }}" --max-clips "\${{ inputs.max_clips }}" --out youtube-clips 2>&1 | tee youtube-clips/run.log
+          python -u clip_youtube_v1.py --url "${{ inputs.youtube_url }}" --max-clips "${{ inputs.max_clips }}" --out youtube-clips 2>&1 | tee youtube-clips/run.log
       - name: Upload only selected clips and report
         if: always()
         uses: actions/upload-artifact@v4
